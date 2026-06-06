@@ -28,7 +28,8 @@ const ENGINE_BASE_CONFIG: Omit<PanelTypeConfig, 'panelType'> = {
   defaultWidth: 300, 
   defaultHeight: 300, 
   minSize: 100,
-  lifecycle: 'multi', 
+  shared: true,       // 默认启用共享容器
+  syncAll: false,     // 默认不自动同步所有 ref
   resizable: true, 
   draggable: true, 
   floatable: true, 
@@ -47,6 +48,10 @@ export class IaiEngine {
   private root: Node | null = null;
   private freePanels = new Map<string, FreePanel>();
   private stashPool = new Map<string, StashEntry>();
+
+  // ── 共享容器与私有容器（数据管理） ──
+  private sharedContainers = new Map<string, Record<string, any>>();
+  private privateContainers = new Map<string, Record<string, any>>();
 
   // ── 事件与焦点 ──
   public readonly events = new EventBus<EngineEvents>();
@@ -89,6 +94,15 @@ export class IaiEngine {
       ...(config || {}), 
       panelType: type 
     });
+
+    // 如果配置了 shared: true，则创建一个普通空对象作为共享容器（不在这里做响应式）
+    const fullConfig = this.getPanelProps({ panelType: type } as PanelEntity);
+    if (fullConfig.shared) {
+      if (!this.sharedContainers.has(type)) {
+        this.sharedContainers.set(type, {});
+      }
+    }
+
     return this;
   }
 
@@ -112,6 +126,11 @@ export class IaiEngine {
 
   public getPlugins(): IaiPlugin[] {
     return Array.from(this.plugins.values());
+  }
+
+  /** 获取所有已注册的面板类型列表 */
+  public getRegisteredTypes(): string[] {
+    return Array.from(this.compRegistry.keys());
   }
 
   // ═══════════════════════════════════════
@@ -168,6 +187,22 @@ export class IaiEngine {
       instanceId: master.instanceId || master.id,
       ...rest
     };
+  }
+
+    /** 获取面板类型的全局共享容器（普通对象，由 Vue 层负责响应式包装） */
+  public getSharedContainer(panelType: string): Record<string, any> {
+    if (!this.sharedContainers.has(panelType)) {
+      this.sharedContainers.set(panelType, {});
+    }
+    return this.sharedContainers.get(panelType)!;
+  }
+
+  /** 获取面板实例的私有容器（普通对象，由 Vue 层负责响应式包装） */
+  public getPrivateContainer(panelId: string): Record<string, any> {
+    if (!this.privateContainers.has(panelId)) {
+      this.privateContainers.set(panelId, {});
+    }
+    return this.privateContainers.get(panelId)!;
   }
 
   // ═══════════════════════════════════════
@@ -377,7 +412,7 @@ export class IaiEngine {
   // ═══════════════════════════════════════
   public stash(id: string): boolean {
     const entity = this.getAny(id);
-    if (!entity || entity.isMaster === false) return false;
+    if (!entity) return false;
     this.stashPool.set(entity.instanceId || entity.id, { ...entity });
     this.deleteAny(id);
     this.events.emit('stash:update', { count: this.stashPool.size });

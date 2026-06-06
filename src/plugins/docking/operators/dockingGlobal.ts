@@ -2,8 +2,6 @@
 import type { Operator } from '../../operator/types';
 import { dockingState } from '../state';
 
-const EDGE_THRESHOLD = 30;
-
 type EdgeZone = 'left' | 'right' | 'top' | 'bottom';
 
 export const dockingGlobal: Operator = {
@@ -11,14 +9,18 @@ export const dockingGlobal: Operator = {
   execute({ engine, props }) {
     const { sourceId, initialX, initialY } = props;
     const opPlugin = engine.getPlugins().find((p: any) => p.name === 'OperatorPlugin') as any;
+    // 🌟 1. 获取 Docking 插件实例
+    const dockingPlugin = engine.getPlugins().find((p: any) => p.name === 'DockingPlugin') as any;
     if (!opPlugin) return;
 
-    // 🌟 获取源面板的真实图纸属性
+    // 🌟 2. 读取配置，注入动态阈值
+    const config = dockingPlugin?.config || {};
+    const globalEdgeThreshold = config.globalEdgeThreshold ?? 120;
+    const dragThreshold = config.dragThreshold ?? 5;
+
     const sourceData = engine.getAny(sourceId);
     if (!sourceData) return;
     const realProps = engine.getPanelProps(sourceData);
-    
-    // 取出配置的真实默认宽高，可能为 undefined
     const defaultW = realProps.defaultWidth;
     const defaultH = realProps.defaultHeight;
 
@@ -26,33 +28,43 @@ export const dockingGlobal: Operator = {
       sourceId,
       initialX,
       initialY,
-      threshold: 5,
-      detectHover: true,
+      threshold: dragThreshold, // 🌟 绑定拖拽阈值
+      detectHover: false,
     });
 
     let lastZone: EdgeZone | null = null;
 
     const onMove = (data: any) => {
       if (data.sourceId !== sourceId) return;
-      if (data.hoveredPanelId && data.hoveredPanelId !== sourceId) {
-        dockingState.zone = null;
-        dockingState.rect = null;
-        lastZone = null;
-        return;
-      }
 
       const localX = data.x;
       const localY = data.y;
+
       const vp = engine.getViewport();
       const containerW = vp.width || window.innerWidth;
       const containerH = vp.height || window.innerHeight;
 
-      const zone = detectEdge(localX, localY, containerW, containerH);
+      const distLeft = Math.abs(localX);
+      const distRight = Math.abs(localX - containerW);
+      const distTop = Math.abs(localY);
+      const distBottom = Math.abs(localY - containerH);
+
+      const minDist = Math.min(distLeft, distRight, distTop, distBottom);
+      let zone: EdgeZone | null = null;
+
+      // 🌟 3. 使用配置项中的全局边缘阈值
+      if (minDist <= globalEdgeThreshold) {
+        if (minDist === distLeft) zone = 'left';
+        else if (minDist === distRight) zone = 'right';
+        else if (minDist === distTop) zone = 'top';
+        else if (minDist === distBottom) zone = 'bottom';
+      }
+
       lastZone = zone;
       dockingState.zone = zone;
-      
-      // 直接计算出需要渲染的最终绝对像素坐标
-      dockingState.rect = zone ? getEdgeRect(zone, containerW, containerH, defaultW, defaultH) : null;
+      dockingState.rect = zone
+        ? getEdgeRect(zone, containerW, containerH, defaultW, defaultH)
+        : null;
     };
 
     const onEnd = () => {
@@ -72,19 +84,9 @@ export const dockingGlobal: Operator = {
 
 // ── 辅助函数 ──
 
-function detectEdge(x: number, y: number, w: number, h: number): EdgeZone | null {
-  if (x <= EDGE_THRESHOLD) return 'left';
-  if (x >= w - EDGE_THRESHOLD) return 'right';
-  if (y <= EDGE_THRESHOLD) return 'top';
-  if (y >= h - EDGE_THRESHOLD) return 'bottom';
-  return null;
-}
-
 function getEdgeRect(zone: EdgeZone, containerW: number, containerH: number, defaultW?: number, defaultH?: number) {
-  // 🌟 核心逻辑：如果图纸里传了真实像素，就用（但不超过屏幕一半）。如果没传，使用 20% (0.2) 默认比例。
   const targetW = defaultW ? Math.min(defaultW, containerW * 0.5) : containerW * 0.2;
   const targetH = defaultH ? Math.min(defaultH, containerH * 0.5) : containerH * 0.2;
-
   if (zone === 'left') return { x: 0, y: 0, width: targetW, height: containerH };
   if (zone === 'right') return { x: containerW - targetW, y: 0, width: targetW, height: containerH };
   if (zone === 'top') return { x: 0, y: 0, width: containerW, height: targetH };
@@ -95,28 +97,17 @@ function getEdgeRect(zone: EdgeZone, containerW: number, containerH: number, def
 function executeGlobalDocking(engine: any, sourceId: string, zone: EdgeZone) {
   const sourceData = engine.getAny(sourceId);
   if (!sourceData) return;
-
   engine.getFree(sourceId) ? engine.removeFree(sourceId) : engine.deleteNode(sourceId);
-
-  const direction = (zone === 'left' || zone === 'right') ? 'horizontal' : 'vertical';
-  const insertAsSecond = (zone === 'right' || zone === 'bottom');
-
+  const direction = zone === 'left' || zone === 'right' ? 'horizontal' : 'vertical';
+  const insertAsSecond = zone === 'right' || zone === 'bottom';
   const newLeaf = { ...sourceData, type: 'leaf' };
-
   const root = engine.getRoot();
-  if (!root) {
-    engine.mount(newLeaf, true);
-    return;
-  }
-
-  const vp = engine.getViewport();
-  const containerW = vp.width || window.innerWidth;
-  const containerH = vp.height || window.innerHeight;
-
+  if (!root) { engine.mount(newLeaf, true); return; }
+  const layoutEl = document.querySelector('.iai-layout-container');
+  const containerW = layoutEl?.clientWidth || window.innerWidth;
+  const containerH = layoutEl?.clientHeight || window.innerHeight;
   const realProps = engine.getPanelProps(sourceData);
   let ratio = 0.5;
-  
-  // 🌟 反算出最终插入树节点时的比例
   if (direction === 'horizontal') {
     const targetW = realProps.defaultWidth ? Math.min(realProps.defaultWidth, containerW * 0.5) : containerW * 0.2;
     ratio = targetW / containerW;
@@ -124,15 +115,5 @@ function executeGlobalDocking(engine: any, sourceId: string, zone: EdgeZone) {
     const targetH = realProps.defaultHeight ? Math.min(realProps.defaultHeight, containerH * 0.5) : containerH * 0.2;
     ratio = targetH / containerH;
   }
-
-  engine.mount(
-    {
-      type: 'split',
-      id: `split-${Date.now()}`,
-      direction,
-      ratio: insertAsSecond ? 1 - ratio : ratio,
-      children: insertAsSecond ? [root, newLeaf] : [newLeaf, root],
-    },
-    true
-  );
+  engine.mount({ type: 'split', id: `split-${Date.now()}`, direction, ratio: insertAsSecond ? 1 - ratio : ratio, children: insertAsSecond ? [root, newLeaf] : [newLeaf, root] }, true);
 }

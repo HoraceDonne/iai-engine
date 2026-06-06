@@ -1,20 +1,19 @@
 <template>
   <div class="float-resize-overlay">
     <template v-for="fp in freePanels" :key="fp.id">
-      <!-- 只为当前聚焦的悬浮窗渲染把手 -->
-      <template v-if="fp.id === activeFloatId && isResizable(fp.panel)">
-        <!-- 仅右下角三角形模式 -->
+      <template v-if="isResizable(fp.panel)">
         <div
           v-if="config.cornerOnly"
           class="resize-handle corner-only"
           :style="getCornerStyle(fp)"
           @pointerdown.prevent.stop="startResize(fp, 'se', $event)"
-        />
-        <!-- 八向把手模式 -->
+        >
+          <div class="corner-visual"></div>
+        </div>
         <template v-else>
           <div
             v-for="handle in getHandles(fp)"
-            :key="handle.dir"
+            :key="`${fp.id}-${handle.dir}`"
             class="resize-handle"
             :class="`handle-${handle.dir}`"
             :style="handle.style"
@@ -27,67 +26,57 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted } from 'vue';
+import { ref, reactive, onMounted, onUnmounted } from 'vue';
 import { useEngine } from '../../../renderers/vue/composables/useIai';
-import { computeResizeRect, type ResizeDirection } from '../core';
-import { clampResize } from '../../../core/constraint';
-import type { FloatResizePlugin } from '../index';
+import { calculateSnappedResizeRect, type ResizeDirection } from '../core';
+import type { FloatPlugin } from '../index';
+import { DEFAULT_FLOAT_CONFIG } from '../config';
 
 const engine = useEngine();
-const plugin = engine.getPlugins().find(p => p.name === 'FloatResizePlugin') as FloatResizePlugin;
-const config = computed(() => plugin.config);
-const getPanelProps = (panel: any) => engine.getPanelProps(panel);
 
-// 🌟 核心修复：用事件驱动的 ref 替代 computed，确保响应式更新
+// 🌟 安全获取 FloatPlugin 实例，可能尚未安装或查找失败
+let plugin: FloatPlugin | undefined;
+
+try {
+  plugin = engine.getPlugins().find(p => p.name === 'FloatPlugin') as FloatPlugin | undefined;
+} catch (e) {
+  console.warn('[FloatOverlay] 无法获取 FloatPlugin 实例', e);
+}
+
+// 🌟 使用插件配置的响应式副本，若插件不存在则回退到默认配置
+const config = reactive(
+  plugin ? { ...plugin.config } : { ...DEFAULT_FLOAT_CONFIG }
+);
+
+// 如果插件存在但后续才安装，可以监听插件变化？简单场景下不会发生，所以当前处理足够
+
+// 同步悬浮窗列表
 const freePanels = ref<any[]>([]);
 const updateFreePanels = () => {
   freePanels.value = engine.getAllFree();
 };
 
-const activeFloatId = ref<string | null>(null);
-const updateActiveFloat = () => {
-  const focused = engine.getFocus();
-  if (focused && engine.getFree(focused)) {
-    // 🌟 自动置顶：将聚焦的悬浮窗 zIndex 设为最大
-    const allFree = engine.getAllFree();
-    const maxZ = allFree.reduce((max, f) => Math.max(max, f.zIndex), 0);
-    engine.updateFree(focused, { zIndex: maxZ + 1 });
-
-    activeFloatId.value = focused;
-  } else {
-    activeFloatId.value = null;
-  }
-};
-
 onMounted(() => {
-  engine.events.on('free:update' as any, updateFreePanels);
-  engine.events.on('focus:change' as any, updateActiveFloat);
+  engine.events.on('free:update', updateFreePanels);
   updateFreePanels();
-  updateActiveFloat();
 });
 
 onUnmounted(() => {
-  engine.events.off('free:update' as any, updateFreePanels);
-  engine.events.off('focus:change' as any, updateActiveFloat);
+  engine.events.off('free:update', updateFreePanels);
 });
 
 const isResizable = (panel: any) => {
-  const props = getPanelProps(panel);
+  const props = engine.getPanelProps(panel);
   return props.resizable !== false;
 };
 
 const getHandles = (fp: any) => {
-  const s = 16;
+  const s = config.handleSize;
   const h = s / 2;
-  const c = s * 1.5;
+  const c = s * 2;
   const ch = c / 2;
 
-  const baseStyle = {
-    position: 'absolute' as const,
-    background: config.value.handleColor,
-    boxSizing: 'border-box' as const,
-    zIndex: 100,
-  };
+  const baseStyle = { position: 'absolute' as const, boxSizing: 'border-box' as const };
 
   return [
     { dir: 'n' as ResizeDirection, style: { ...baseStyle, left: `${fp.x}px`, top: `${fp.y - h}px`, width: `${fp.width}px`, height: `${s}px`, cursor: 'ns-resize' } },
@@ -102,45 +91,47 @@ const getHandles = (fp: any) => {
 };
 
 const getCornerStyle = (fp: any) => {
+  const s = config.handleSize * 2;
   return {
     position: 'absolute' as const,
-    left: `${fp.x + fp.width}px`,
-    top: `${fp.y + fp.height}px`,
-    width: '0',
-    height: '0',
-    borderLeft: '12px solid transparent',
-    borderTop: `12px solid ${config.value.handleColor}`,
-    cursor: 'nwse-resize',
-    zIndex: 10,
+    left: `${fp.x + fp.width - s}px`,
+    top: `${fp.y + fp.height - s}px`,
+    width: `${s}px`,
+    height: `${s}px`,
+    cursor: 'nwse-resize'
   };
 };
 
 const startResize = (fp: any, direction: ResizeDirection, e: PointerEvent) => {
-  const startRect = { x: fp.x, y: fp.y, width: fp.width, height: fp.height };
-  const opPlugin = engine.getPlugins().find(p => p.name === 'OperatorPlugin') as any;
-  const guides = fp.panel?.meta?.guides || { top: 0, bottom: 0, left: 0, right: 0 };
+  engine.focus(fp.id);
+  const allFree = engine.getAllFree();
+  const maxZ = allFree.reduce((max, f) => Math.max(max, f.zIndex), 0);
+  engine.updateFree(fp.id, { zIndex: maxZ + 1 });
 
+  const startRect = { x: fp.x, y: fp.y, width: fp.width, height: fp.height };
+  const guides = fp.panel?.meta?.guides || {};
+  const realProps = engine.getPanelProps(fp.panel);
+  const panelMinSize = realProps.minSize ?? 40;
+
+  const opPlugin = engine.getPlugins().find(p => p.name === 'OperatorPlugin') as any;
   opPlugin?.exec('drag.start', { sourceId: fp.id, initialX: e.clientX, initialY: e.clientY, threshold: 2 });
 
   const onMove = (data: any) => {
     if (data.sourceId !== fp.id) return;
 
     const vp = engine.getViewport();
-    const boundary = {
-      x: 0, y: 0,
-      width: vp.width || window.innerWidth,
-      height: vp.height || window.innerHeight,
-    };
+    const boundary = { x: 0, y: 0, width: vp.width || window.innerWidth, height: vp.height || window.innerHeight };
 
-    const newRect = clampResize({
+    const newRect = calculateSnappedResizeRect({
       startRect,
       boundary,
-      offsets: guides,
+      guides,
       handle: direction,
       deltaX: data.deltaX,
       deltaY: data.deltaY,
-      minWidth: config.value.minSize,
-      minHeight: config.value.minSize,
+      minSize: panelMinSize,
+      enableSnap: config.enableSnap,
+      snapThreshold: config.snapThreshold
     });
 
     engine.updateFree(fp.id, newRect);
@@ -165,5 +156,23 @@ const startResize = (fp: any, direction: ResizeDirection, e: PointerEvent) => {
 }
 .resize-handle {
   pointer-events: auto;
+  transition: background-color 0.15s ease-out;
+  background-color: transparent;
+}
+.resize-handle:hover {
+  background-color: rgba(0, 122, 204, 0.4);
+}
+.resize-handle.corner-only .corner-visual {
+  position: absolute;
+  right: 2px;
+  bottom: 2px;
+  width: 0;
+  height: 0;
+  border-left: 12px solid transparent;
+  border-bottom: 12px solid rgba(150, 150, 150, 0.6);
+  transition: border-bottom-color 0.15s ease-out;
+}
+.resize-handle.corner-only:hover .corner-visual {
+  border-bottom-color: rgba(0, 122, 204, 0.9);
 }
 </style>

@@ -1,5 +1,4 @@
 export type Direction = 'horizontal' | 'vertical';
-export type LifecycleMode = 'singleton' | 'multi' | 'volatile';
 
 export interface Rect {
   x: number; y: number; width: number; height: number;
@@ -23,11 +22,14 @@ export interface PanelTypeConfig {
   aspectRatio?: number;
 
   // 行为权限基准
-  lifecycle: LifecycleMode;
   resizable: boolean;
   draggable: boolean;
   floatable: boolean;
   closable: boolean;
+  shared?: boolean;   // 新增：是否启用共享容器
+  syncAll?: boolean;  // 新增：是否默认同步所有顶层 ref
+
+  meta?: Record<string, any>; 
 }
 
 // ── 2. 动态面板实体 (Instance) ──
@@ -38,7 +40,6 @@ export interface PanelEntity {
   panelType: string;   // 指向其所属的静态配置类型
   isMaster: boolean;   // 状态：本体还是影子
   instanceId?: string; // 影子的溯源 ID
-  lifecycle?: LifecycleMode;
   
   // 物理与权限的实例级覆盖值 (Overrides)
   minSize?: number;

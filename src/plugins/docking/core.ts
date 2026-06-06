@@ -2,21 +2,46 @@ import type { Rect } from '../../core/types';
 
 export type DropZone = 'center' | 'left' | 'right' | 'top' | 'bottom' | null;
 
-/**
- * 计算鼠标在目标面板内的五宫格停靠区域
- */
-export function calculateDropZone(x: number, y: number, rect: Rect): DropZone {
+export interface DockingConfig {
+  /** 边缘停靠热区占面板宽高的比例，默认 0.3 */
+  edgeRatio?: number;
+  /** 中心交换热区占面板宽高的比例，默认 0.4 */
+  centerRatio?: number;
+  /** 全局边缘停靠热区阈值（px），默认 120 */
+  globalEdgeThreshold?: number;
+  /** 拖拽移动阈值（px），默认 5 */
+  dragThreshold?: number;
+
+}
+
+export function calculateDropZone(
+  x: number,
+  y: number,
+  rect: Rect,
+  edgeRatio: number = 0.3,
+  centerRatio: number = 0.4
+): DropZone {
   if (x < rect.x || x > rect.x + rect.width || y < rect.y || y > rect.y + rect.height) {
     return null;
   }
   const xRate = (x - rect.x) / rect.width;
   const yRate = (y - rect.y) / rect.height;
 
-  if (xRate > 0.3 && xRate < 0.7 && yRate > 0.3 && yRate < 0.7) return 'center';
+  if (
+    xRate > edgeRatio && xRate < (1 - edgeRatio) &&
+    yRate > edgeRatio && yRate < (1 - edgeRatio)
+  ) {
+    return 'center';
+  }
 
-  const min = Math.min(yRate, 1 - yRate, xRate, 1 - xRate);
-  if (min === yRate) return 'top';
-  if (min === 1 - yRate) return 'bottom';
-  if (min === xRate) return 'left';
+  const distLeft = xRate;
+  const distRight = 1 - xRate;
+  const distTop = yRate;
+  const distBottom = 1 - yRate;
+
+  const minDist = Math.min(distLeft, distRight, distTop, distBottom);
+  if (minDist === distTop) return 'top';
+  if (minDist === distBottom) return 'bottom';
+  if (minDist === distLeft) return 'left';
   return 'right';
 }

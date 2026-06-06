@@ -1,0 +1,3914 @@
+============================================================
+文件: src/core/constraint.ts
+============================================================
+// src/core/constraint.ts
+import type { Rect } from './types';
+
+// ═══════════════════════════════════════
+// 通用类型
+// ═══════════════════════════════════════
+
+export interface ConstraintOffsets {
+  top: number;
+  bottom: number;
+  left: number;
+  right: number;
+}
+
+export type ResizeHandle = 'n' | 's' | 'e' | 'w' | 'ne' | 'nw' | 'se' | 'sw';
+
+// ═══════════════════════════════════════
+// 平移约束求解器
+// ═══════════════════════════════════════
+
+export interface ResolveConstraintConfig {
+  rect: Rect;
+  boundary: Rect;
+  offsets: ConstraintOffsets;
+}
+
+/**
+ * 平移模式：保持面板尺寸不变，只通过平移来满足四参考线约束
+ * 适用场景：拖拽移动悬浮窗
+ */
+export function resolveConstraint({
+  rect,
+  boundary,
+  offsets,
+}: ResolveConstraintConfig): Rect {
+  let { x, y, width, height } = rect;
+
+  // X 轴独立求解
+  const minX = boundary.x - offsets.left;
+  const maxX = boundary.x + boundary.width - width + offsets.right;
+  let targetX = x;
+  if (minX > maxX) {
+    targetX = minX;
+  } else {
+    targetX = Math.max(minX, Math.min(maxX, targetX));
+  }
+
+  // Y 轴独立求解
+  const minY = boundary.y - offsets.top;
+  const maxY = boundary.y + boundary.height - height + offsets.bottom;
+  let targetY = y;
+  if (minY > maxY) {
+    targetY = minY;
+  } else {
+    targetY = Math.max(minY, Math.min(maxY, targetY));
+  }
+
+  return { x: targetX, y: targetY, width, height };
+}
+
+// ═══════════════════════════════════════
+// 缩放约束求解器（锚点驱动）
+// ═══════════════════════════════════════
+
+export interface ClampResizeConfig {
+  startRect: Rect;
+  boundary: Rect;
+  offsets: ConstraintOffsets;
+  handle: ResizeHandle;
+  deltaX: number;
+  deltaY: number;
+  minWidth?: number;
+  minHeight?: number;
+}
+
+/**
+ * 缩放模式：锚点固定，通过限制尺寸变化来满足四参考线约束
+ * 适用场景：拖拽把手调整悬浮窗大小
+ */
+export function clampResize({
+  startRect,
+  boundary,
+  offsets,
+  handle,
+  deltaX,
+  deltaY,
+  minWidth = 40,
+  minHeight = 40,
+}: ClampResizeConfig): Rect {
+  let targetX = startRect.x;
+  let targetY = startRect.y;
+  let targetW = startRect.width;
+  let targetH = startRect.height;
+
+  const limitLeft = boundary.x - offsets.left;
+  const limitRight = boundary.x + boundary.width + offsets.right;
+  const limitTop = boundary.y - offsets.top;
+  const limitBottom = boundary.y + boundary.height + offsets.bottom;
+
+  // X 轴
+  if (handle.includes('e')) {
+    let newW = startRect.width + deltaX;
+    const maxW = limitRight - startRect.x;
+    targetW = Math.max(minWidth, Math.min(newW, maxW));
+  } else if (handle.includes('w')) {
+    const rightAnchor = startRect.x + startRect.width;
+    let newX = startRect.x + deltaX;
+    const maxX = rightAnchor - minWidth;
+    targetX = Math.max(limitLeft, Math.min(newX, maxX));
+    targetW = rightAnchor - targetX;
+  }
+
+  // Y 轴
+  if (handle.includes('s')) {
+    let newH = startRect.height + deltaY;
+    const maxH = limitBottom - startRect.y;
+    targetH = Math.max(minHeight, Math.min(newH, maxH));
+  } else if (handle.includes('n')) {
+    const bottomAnchor = startRect.y + startRect.height;
+    let newY = startRect.y + deltaY;
+    const maxY = bottomAnchor - minHeight;
+    targetY = Math.max(limitTop, Math.min(newY, maxY));
+    targetH = bottomAnchor - targetY;
+  }
+
+  return { x: targetX, y: targetY, width: targetW, height: targetH };
+}
+
+============================================================
+文件: src/core/EventBus.ts
+============================================================
+export class EventBus<T extends Record<string, any>> {
+  private listeners: { [K in keyof T]?: Array<(payload: T[K]) => void> } = {};
+
+  on<K extends keyof T>(event: K, callback: (payload: T[K]) => void) {
+    if (!this.listeners[event]) {
+      this.listeners[event] = [];
+    }
+    this.listeners[event]!.push(callback);
+  }
+
+  off<K extends keyof T>(event: K, callback: (payload: T[K]) => void) {
+    if (this.listeners[event]) {
+      this.listeners[event] = this.listeners[event]!.filter(cb => cb !== callback);
+    }
+  }
+
+  emit<K extends keyof T>(event: K, payload: T[K]) {
+    if (this.listeners[event]) {
+      this.listeners[event]!.forEach(cb => cb(payload));
+    }
+  }
+}
+
+============================================================
+文件: src/core/IaiEngine.ts
+============================================================
+// src/core/IaiEngine.ts
+import { EventBus } from './EventBus';
+import type {
+  Node, LeafNode, SplitNode, PanelEntity, FreePanel, StashEntry,
+  GeometryMap, RenderPipelineConfig, RenderItem,
+  Direction, Rect, PanelTypeConfig
+} from './types';
+import { computeGeometryMap, extractOrthogonalGrid, type OrthogonalGrid } from './solver';
+import type { IaiPlugin } from '../plugins/types';
+
+// ── 事件定义 ──
+export interface EngineEvents {
+  'tree:update': { tree: Node | null };
+  'free:update': { count: number };
+  'stash:update': { count: number };
+  'focus:change': { id: string | null };
+  'hover:change': { id: string | null };
+  'drag:start': { sourceId: string; sourceType: 'grid' | 'float' };
+  'drag:move': { sourceId: string; sourceType: 'grid' | 'float'; x: number; y: number; deltaX: number; deltaY: number; hoveredPanelId: string | null };
+  'drag:end': { sourceId: string; sourceType: 'grid' | 'float'; endX: number; endY: number; deltaX: number; deltaY: number; hoveredPanelId: string | null };
+  'drag:shield': { active: boolean; cursor?: string };
+  'panel:destroyed': { id: string };
+}
+
+// ── 1. 引擎绝对底线默认值 (兜底) ──
+const ENGINE_BASE_CONFIG: Omit<PanelTypeConfig, 'panelType'> = {
+  title: '未命名面板',
+  defaultWidth: 300, 
+  defaultHeight: 300, 
+  minSize: 100,
+  shared: true,       // 默认启用共享容器
+  syncAll: false,     // 默认不自动同步所有 ref
+  resizable: true, 
+  draggable: true, 
+  floatable: true, 
+  closable: true
+};
+
+// ── 引擎主体 ──
+export class IaiEngine {
+  // ── 注册表 ──
+  private compRegistry = new Map<string, any>();
+  // 存储在 reg() 时显式传入的面板配置
+  private typeRegistry = new Map<string, Partial<PanelTypeConfig>>(); 
+  private plugins = new Map<string, IaiPlugin>();
+
+  // ── 动态数据池 ──
+  private root: Node | null = null;
+  private freePanels = new Map<string, FreePanel>();
+  private stashPool = new Map<string, StashEntry>();
+
+  // ── 共享容器与私有容器（数据管理） ──
+  private sharedContainers = new Map<string, Record<string, any>>();
+  private privateContainers = new Map<string, Record<string, any>>();
+
+  // ── 事件与焦点 ──
+  public readonly events = new EventBus<EngineEvents>();
+  private focusedId: string | null = null;
+  private hoveredId: string | null = null;
+
+  // ── 配置与视口 ──
+  private config: RenderPipelineConfig = { gear: 'balanced', snapToPixel: true };
+  private _viewport: { width: number; height: number } = { width: 0, height: 0 };
+
+  // ── 内部工具 ──
+  private uid(prefix: string) {
+    return `${prefix}-${Math.random().toString(36).slice(2, 6)}`;
+  }
+
+  // ═══════════════════════════════════════
+  // 窗口获取
+  // ═══════════════════════════════════════
+  public setViewport(w: number, h: number) {
+    this._viewport = { width: w, height: h };
+  }
+
+  public getViewport() {
+    return this._viewport;
+  }
+
+  // ═══════════════════════════════════════
+  // 阶段一：资产注册 & 插件 (Registration)
+  // ═══════════════════════════════════════
+  
+  /**
+   * 注册面板组件与配置
+   * @param type 面板类型 (如 'test')
+   * @param comp 框架组件 (如 markRaw(TestPanel))
+   * @param config 显式配置，按需传入，没传的将使用引擎底线默认值
+   */
+  public reg(type: string, comp: any, config?: Partial<Omit<PanelTypeConfig, 'panelType'>>): this {
+    this.compRegistry.set(type, comp);
+    this.typeRegistry.set(type, { 
+      ...(config || {}), 
+      panelType: type 
+    });
+
+    // 如果配置了 shared: true，则创建一个普通空对象作为共享容器（不在这里做响应式）
+    const fullConfig = this.getPanelProps({ panelType: type } as PanelEntity);
+    if (fullConfig.shared) {
+      if (!this.sharedContainers.has(type)) {
+        this.sharedContainers.set(type, {});
+      }
+    }
+
+    return this;
+  }
+
+  public getComp(type: string) {
+    return this.compRegistry.get(type);
+  }
+
+  public use(plugin: IaiPlugin): this {
+    plugin.install(this);
+    this.plugins.set(plugin.name, plugin);
+    return this;
+  }
+
+  public unuse(name: string): boolean {
+    const p = this.plugins.get(name);
+    if (!p) return false;
+    p.uninstall?.(this);
+    this.plugins.delete(name);
+    return true;
+  }
+
+  public getPlugins(): IaiPlugin[] {
+    return Array.from(this.plugins.values());
+  }
+
+  /** 获取所有已注册的面板类型列表 */
+  public getRegisteredTypes(): string[] {
+    return Array.from(this.compRegistry.keys());
+  }
+
+  // ═══════════════════════════════════════
+  // 阶段二：动态合成 (The Data Merger) 🌟 核心枢纽
+  // ═══════════════════════════════════════
+  
+  /**
+   * 核心 API：获取面板在当前时刻的“最终有效属性”。
+   * 任何需要读取面板 minSize、title 等属性的地方，都必须通过此方法获取。
+   */
+  public getPanelProps(entity: PanelEntity): PanelTypeConfig & PanelEntity {
+    // 1. 抓取在 reg() 注册时存入的特定配置
+    const registeredConfig = this.typeRegistry.get(entity.panelType) || {};
+    
+    // 2. 清洗 entity 中的 undefined，防止覆盖掉配置中的有效值
+    const cleanEntity = Object.fromEntries(
+      Object.entries(entity).filter(([_, v]) => v !== undefined)
+    );
+
+    // 3. 完美的三重合并：内置底线 < 注册配置 < 实例动态值
+    return {
+      ...ENGINE_BASE_CONFIG,
+      panelType: entity.panelType, 
+      ...registeredConfig,
+      ...cleanEntity
+    } as PanelTypeConfig & PanelEntity;
+  }
+
+  // ═══════════════════════════════════════
+  // 阶段三：实例工厂 (The Factory)
+  // ═══════════════════════════════════════
+
+  /** 创建本体：极简轻量，仅生成实体壳子，绝不冗余存储默认值 */
+  public createMaster(panelType: string, overrides?: Partial<PanelEntity>): PanelEntity {
+    const id = this.uid('master');
+    const { id: _id, instanceId, isMaster, panelType: _pt, type, ...rest } = overrides || {} as any;
+    return {
+      id,
+      panelType,
+      isMaster: true,
+      instanceId: id,
+      ...rest
+    };
+  }
+
+  /** 创建影子：追溯本体 ID */
+  public createShadow(master: PanelEntity, panelType?: string, overrides?: Partial<PanelEntity>): PanelEntity {
+    const id = this.uid('shadow');
+    const { id: _id, instanceId, isMaster, panelType: _pt, type, ...rest } = overrides || {} as any;
+    return {
+      id,
+      panelType: panelType ?? master.panelType,
+      isMaster: false,
+      instanceId: master.instanceId || master.id,
+      ...rest
+    };
+  }
+
+    /** 获取面板类型的全局共享容器（普通对象，由 Vue 层负责响应式包装） */
+  public getSharedContainer(panelType: string): Record<string, any> {
+    if (!this.sharedContainers.has(panelType)) {
+      this.sharedContainers.set(panelType, {});
+    }
+    return this.sharedContainers.get(panelType)!;
+  }
+
+  /** 获取面板实例的私有容器（普通对象，由 Vue 层负责响应式包装） */
+  public getPrivateContainer(panelId: string): Record<string, any> {
+    if (!this.privateContainers.has(panelId)) {
+      this.privateContainers.set(panelId, {});
+    }
+    return this.privateContainers.get(panelId)!;
+  }
+
+  // ═══════════════════════════════════════
+  // 焦点系统
+  // ═══════════════════════════════════════
+  public focus(id: string | null): boolean {
+    if (this.focusedId === id) return false;
+    if (id && !this.getAny(id)) return false;
+    this.focusedId = id;
+    this.events.emit('focus:change', { id });
+    return true;
+  }
+
+  public getFocus(): string | null { return this.focusedId; }
+  public focusNext(): void {}
+  public focusPrev(): void {}
+
+  public setHover(id: string | null): void {
+    if (this.hoveredId === id) return;
+    if (id) {
+      const entity = this.getAny(id);
+      if (entity?.ignoreHover) return;
+    }
+    this.hoveredId = id;
+    this.events.emit('hover:change', { id });
+  }
+
+  public getHover(): string | null { return this.hoveredId; }
+
+  // ═══════════════════════════════════════
+  // 结构化池（二叉树）
+  // ═══════════════════════════════════════
+  public mount(tree: Node, trusted = false): void {
+    // 递归规范化传入的树，补全缺失的实体标识 (ID 等)
+    const normalize = (node: any): Node => {
+      if (node.type === 'leaf') {
+        return {
+          id: node.id || this.uid('leaf'),
+          panelType: node.panelType,
+          isMaster: node.isMaster ?? true,
+          instanceId: node.instanceId || node.id || this.uid('leaf'),
+          ...node 
+        } as LeafNode;
+      }
+      return {
+        ...node,
+        id: node.id || this.uid('split'),
+        children: [normalize(node.children[0]), normalize(node.children[1])]
+      } as SplitNode;
+    };
+
+    this.root = trusted ? tree : normalize(JSON.parse(JSON.stringify(tree)));
+    this.emitTree();
+  }
+
+  public getRoot(): Node | null { return this.root; }
+
+  public getNode(id: string): LeafNode | null {
+    if (!this.root) return null;
+    let found: LeafNode | null = null;
+    const dfs = (node: Node) => {
+      if (found) return;
+      if (node.type === 'leaf' && node.id === id) {
+        found = node;
+        return;
+      }
+      if (node.type === 'split') {
+        dfs(node.children[0]);
+        dfs(node.children[1]);
+      }
+    };
+    dfs(this.root);
+    if (found) return { ...(found as LeafNode) };
+    return null;
+  }
+
+  public getAllNodes(): LeafNode[] {
+    const leaves: LeafNode[] = [];
+    if (!this.root) return leaves;
+    const dfs = (node: Node) => {
+      if (node.type === 'leaf') { leaves.push(node); return; }
+      dfs(node.children[0]); dfs(node.children[1]);
+    };
+    dfs(this.root);
+    return leaves.map(n => ({ ...n }));
+  }
+
+  public splitNode(targetId: string, dir: Direction, ratio: number, panel: PanelEntity, insertAsSecond = true): boolean {
+    if (!this.root) return false;
+    let done = false;
+    const traverse = (node: Node): Node => {
+      if (node.type === 'leaf' && node.id === targetId) {
+        done = true;
+        return {
+          type: 'split',
+          id: this.uid('split'),
+          direction: dir,
+          ratio,
+          children: insertAsSecond 
+            ? [node, { ...panel, type: 'leaf' } as LeafNode]
+            : [{ ...panel, type: 'leaf' } as LeafNode, node]
+        };
+      }
+      if (node.type === 'split') {
+        const c1 = traverse(node.children[0]);
+        const c2 = traverse(node.children[1]);
+        if (c1 !== node.children[0] || c2 !== node.children[1]) {
+          return { ...node, children: [c1, c2] };
+        }
+      }
+      return node;
+    };
+    this.root = traverse(this.root);
+    if (done) this.emitTree();
+    return done;
+  }
+
+  public deleteNode(id: string): boolean {
+    if (!this.root) return false;
+    if (this.focusedId === id) this.focus(null);
+    if (this.root.id === id) { this.root = null; this.emitTree(); return true; }
+    
+    let deleted = false;
+    const traverse = (node: Node): Node | null => {
+      if (node.type === 'leaf') {
+        if (node.id === id) { deleted = true; return null; }
+        return node;
+      }
+      const c1 = traverse(node.children[0]);
+      const c2 = traverse(node.children[1]);
+      if (c1 !== null && c2 !== null) {
+        if (c1 === node.children[0] && c2 === node.children[1]) return node;
+        return { ...node, children: [c1, c2] };
+      }
+      return c1 || c2; // 兄弟提升
+    };
+    this.root = traverse(this.root);
+    if (deleted) this.emitTree();
+    return deleted;
+  }
+
+  public replace(id: string, panel: PanelEntity): boolean {
+    if (!this.root) {
+      const fp = this.freePanels.get(id);
+      if (fp) { fp.panel = panel; this.events.emit('free:update', { count: this.freePanels.size }); return true; }
+      return false;
+    }
+
+    let replaced = false;
+    const traverse = (node: Node): Node => {
+      if (node.type === 'split' && node.id === id) {
+        replaced = true;
+        return {
+          ...node,
+          ...panel,
+          type: 'split',
+          children: (node as SplitNode).children,
+        } as SplitNode;
+      }
+      if (node.type === 'leaf' && node.id === id) {
+        replaced = true;
+        return { ...panel, type: 'leaf' } as LeafNode;
+      }
+      if (node.type === 'split') {
+        const c1 = traverse(node.children[0]);
+        const c2 = traverse(node.children[1]);
+        if (c1 !== node.children[0] || c2 !== node.children[1]) return { ...node, children: [c1, c2] };
+      }
+      return node;
+    };
+
+    this.root = traverse(this.root);
+    if (replaced) { this.emitTree(); return true; }
+
+    const fp = this.freePanels.get(id);
+    if (fp) { fp.panel = panel; this.events.emit('free:update', { count: this.freePanels.size }); return true; }
+    return false;
+  }
+
+  // ═══════════════════════════════════════
+  // 自由池
+  // ═══════════════════════════════════════
+  public addFree(panel: PanelEntity, rect: Rect, z = 100): void {
+    this.freePanels.set(panel.id, { id: panel.id, panel, ...rect, zIndex: z });
+    this.events.emit('free:update', { count: this.freePanels.size });
+  }
+
+  public updateFree(id: string, u: Partial<Omit<FreePanel, 'id' | 'panel'>>): boolean {
+    const fp = this.freePanels.get(id);
+    if (!fp) return false;
+    Object.assign(fp, u);
+    this.events.emit('free:update', { count: this.freePanels.size });
+    return true;
+  }
+
+  public removeFree(id: string): boolean {
+    const ok = this.freePanels.delete(id);
+    if (ok) this.events.emit('free:update', { count: this.freePanels.size });
+    return ok;
+  }
+
+  public getFree(id: string): FreePanel | undefined { return this.freePanels.get(id); }
+  public getAllFree(): FreePanel[] { return Array.from(this.freePanels.values()); }
+
+  // ═══════════════════════════════════════
+  // 暂存池（常驻池）
+  // ═══════════════════════════════════════
+  public stash(id: string): boolean {
+    const entity = this.getAny(id);
+    if (!entity) return false;
+    this.stashPool.set(entity.instanceId || entity.id, { ...entity });
+    this.deleteAny(id);
+    this.events.emit('stash:update', { count: this.stashPool.size });
+    return true;
+  }
+
+  public getStash(id: string): PanelEntity | null {
+    return this.stashPool.get(id) ?? null;
+  }
+
+  public getAllStash(): PanelEntity[] {
+    return Array.from(this.stashPool.values());
+  }
+
+  public removeStash(id: string): boolean {
+    const ok = this.stashPool.delete(id);
+    if (ok) this.events.emit('stash:update', { count: this.stashPool.size });
+    return ok;
+  }
+
+  public addToStash(panel: PanelEntity): void {
+    const key = panel.instanceId || panel.id;
+    this.stashPool.set(key, panel);
+    this.events.emit('stash:update', { count: this.stashPool.size });
+  }
+
+  // ═══════════════════════════════════════
+  // 实例/引用查询
+  // ═══════════════════════════════════════
+  public getRefs(instanceId: string): PanelEntity[] {
+    const refs: PanelEntity[] = [];
+    for (const leaf of this.getAllNodes()) {
+      if ((leaf.instanceId || leaf.id) === instanceId) refs.push(leaf);
+    }
+    for (const fp of this.freePanels.values()) {
+      if ((fp.panel.instanceId || fp.panel.id) === instanceId) refs.push(fp.panel);
+    }
+    return refs;
+  }
+
+  public getAny(id: string): PanelEntity | null {
+    return this.getNode(id) ?? this.freePanels.get(id)?.panel ?? this.stashPool.get(id) ?? null;
+  }
+
+  public deleteAny(id: string): boolean {
+    if (this.deleteNode(id)) return true;
+    if (this.removeFree(id)) return true;
+    if (this.removeStash(id)) return true;
+    return false;
+  }
+
+  // ═══════════════════════════════════════
+  // 渲染与几何
+  // ═══════════════════════════════════════
+  public getRenderItems(vw: number, vh: number): RenderItem[] {
+    const items: RenderItem[] = [];
+    if (this.root) {
+      const geoMap = computeGeometryMap(
+        this.root, 
+        { width: vw, height: vh }, 
+        this.config,
+        (node: LeafNode) => this.getPanelProps(node)
+      );
+      for (const leaf of this.getAllNodes()) {
+        const rect = geoMap.get(leaf.id) ?? { x: 0, y: 0, width: 0, height: 0 };
+        items.push({ id: leaf.id, node: leaf, rect, zIndex: 1, isFloating: false });
+      }
+    }
+    for (const fp of this.freePanels.values()) {
+      items.push({
+        id: fp.id,
+        node: fp.panel,
+        rect: { x: fp.x, y: fp.y, width: fp.width, height: fp.height },
+        zIndex: fp.zIndex,
+        isFloating: true,
+        customClass: 'is-floating'
+      });
+    }
+    return items.sort((a, b) => a.zIndex - b.zIndex);
+  }
+
+  public getGeoMap(vw: number, vh: number): GeometryMap {
+    if (!this.root) return new Map();
+    return computeGeometryMap(
+      this.root, 
+      { width: vw, height: vh }, 
+      this.config,
+      (node: LeafNode) => this.getPanelProps(node)
+    );
+  }
+
+  public getGridLines(geoMap: GeometryMap): OrthogonalGrid {
+    if (!this.root) return { vLines: [], hLines: [] };
+    return extractOrthogonalGrid(this.root, geoMap);
+  }
+
+  // ═══════════════════════════════════════
+  // 序列化
+  // ═══════════════════════════════════════
+  public save(): any {
+    return {
+      root: this.root,
+      freePanels: [...this.freePanels.values()],
+      stashPool: [...this.stashPool.values()]
+    };
+  }
+
+  public load(state: any): void {
+    this.root = state.root ?? null;
+    this.freePanels.clear();
+    if (state.freePanels) for (const fp of state.freePanels) this.freePanels.set(fp.id, fp);
+    this.stashPool.clear();
+    if (state.stashPool) for (const s of state.stashPool) this.stashPool.set(s.instanceId || s.id, s);
+    this.events.emit('tree:update', { tree: this.root });
+    this.events.emit('free:update', { count: this.freePanels.size });
+    this.events.emit('stash:update', { count: this.stashPool.size });
+  }
+
+  private emitTree() {
+    this.events.emit('tree:update', { tree: this.root });
+  }
+}
+
+============================================================
+文件: src/core/solver.ts
+============================================================
+// 文件位置: src/core/solver.ts
+import type { Node, Rect, GeometryMap, SolverViewport, RenderPipelineConfig, LeafNode } from './types';
+
+export interface GridLine {
+  id: string;
+  position: number;
+  crossStart: number;
+  crossEnd: number;
+}
+
+export interface OrthogonalGrid {
+  vLines: GridLine[];
+  hLines: GridLine[];
+}
+
+export function computeGeometryMap(
+  root: Node,
+  viewport: SolverViewport,
+  config: RenderPipelineConfig,
+  getProps: (node: LeafNode) => any // 🌟 唯一修改：接收引擎属性
+): GeometryMap {
+  const map: GeometryMap = new Map();
+  if (!root) return map;
+
+  const rootRect: Rect = {
+    x: 0,
+    y: 0,
+    width: Math.max(0, viewport.width),
+    height: Math.max(0, viewport.height),
+  };
+
+  function layout(node: Node, rect: Rect) {
+    map.set(node.id, {
+      x: Math.round(rect.x),
+      y: Math.round(rect.y),
+      width: Math.round(rect.width),
+      height: Math.round(rect.height),
+    });
+
+    if (node.type === 'leaf') return;
+
+    const [child1, child2] = node.children;
+
+    if (node.direction === 'horizontal') {
+      const min1 = getTreeMinSize(child1, 'horizontal', getProps);
+      const min2 = getTreeMinSize(child2, 'horizontal', getProps);
+
+      const fixed1 = child1.type === 'leaf' && child1.isFixed ? child1.fixedSize : null;
+      const fixed2 = child2.type === 'leaf' && child2.isFixed ? child2.fixedSize : null;
+
+      let w1: number, w2: number;
+      if (fixed1 !== null && fixed1 !== undefined) {
+        w1 = fixed1;
+        w2 = rect.width - w1;
+      } else if (fixed2 !== null && fixed2 !== undefined) {
+        w2 = fixed2;
+        w1 = rect.width - w2;
+      } else {
+        w1 = Math.round(rect.width * node.ratio);
+        w2 = rect.width - w1;
+      }
+
+      // minSize 钳制：保证不会小于最小值
+      if (w1 < min1) { w1 = min1; w2 = rect.width - w1; }
+      if (w2 < min2) { w2 = min2; w1 = rect.width - w2; }
+
+      // lockedAtMin 锁定机制
+      if (child1.type === 'leaf' && child1.lockedAtMin && w1 > min1) {
+        w1 = min1;
+        w2 = rect.width - w1;
+      }
+      if (child2.type === 'leaf' && child2.lockedAtMin && w2 > min2) {
+        w2 = min2;
+        w1 = rect.width - w2;
+      }
+
+      // 极端情况：窗口太小，无法同时满足两个 minSize，等比缩放
+      if (rect.width < min1 + min2 && min1 + min2 > 0) {
+        const scale = rect.width / (min1 + min2);
+        w1 = Math.round(min1 * scale);
+        w2 = rect.width - w1;
+      }
+
+      layout(child1, { x: rect.x, y: rect.y, width: w1, height: rect.height });
+      layout(child2, { x: rect.x + w1, y: rect.y, width: w2, height: rect.height });
+
+    } else {
+      const min1 = getTreeMinSize(child1, 'vertical', getProps);
+      const min2 = getTreeMinSize(child2, 'vertical', getProps);
+
+      const fixed1 = child1.type === 'leaf' && child1.isFixed ? child1.fixedSize : null;
+      const fixed2 = child2.type === 'leaf' && child2.isFixed ? child2.fixedSize : null;
+
+      let h1: number, h2: number;
+      if (fixed1 !== null && fixed1 !== undefined) {
+        h1 = fixed1;
+        h2 = rect.height - h1;
+      } else if (fixed2 !== null && fixed2 !== undefined) {
+        h2 = fixed2;
+        h1 = rect.height - h2;
+      } else {
+        h1 = Math.round(rect.height * node.ratio);
+        h2 = rect.height - h1;
+      }
+
+      // minSize 钳制
+      if (h1 < min1) { h1 = min1; h2 = rect.height - h1; }
+      if (h2 < min2) { h2 = min2; h1 = rect.height - h2; }
+
+      // 极端情况等比缩放
+      if (rect.height < min1 + min2 && min1 + min2 > 0) {
+        const scale = rect.height / (min1 + min2);
+        h1 = Math.round(min1 * scale);
+        h2 = rect.height - h1;
+      }
+
+      layout(child1, { x: rect.x, y: rect.y, width: rect.width, height: h1 });
+      layout(child2, { x: rect.x, y: rect.y + h1, width: rect.width, height: h2 });
+    }
+  }
+
+  layout(root, rootRect);
+  return map;
+}
+
+// 计算子树的最小尺寸
+function getTreeMinSize(node: Node, direction: 'horizontal' | 'vertical', getProps: (node: LeafNode) => any): number {
+  if (node.type === 'leaf') {
+    if (node.isFixed && node.fixedSize !== undefined) return node.fixedSize;
+    // 🌟 唯一修改：获取真实属性
+    return getProps(node as LeafNode).minSize ?? 40;
+  }
+  if (node.direction === direction) {
+    return getTreeMinSize(node.children[0], direction, getProps) + getTreeMinSize(node.children[1], direction, getProps);
+  } else {
+    return Math.max(getTreeMinSize(node.children[0], direction, getProps), getTreeMinSize(node.children[1], direction, getProps));
+  }
+}
+
+export function extractOrthogonalGrid(
+  root: Node,
+  geometryMap: GeometryMap
+): OrthogonalGrid {
+  const vLines: GridLine[] = [];
+  const hLines: GridLine[] = [];
+
+  function traverse(node: Node) {
+    if (node.type === 'leaf') return;
+    const rect = geometryMap.get(node.id);
+    if (!rect) return;
+    const child1 = node.children[0];
+    const child1Rect = geometryMap.get(child1.id);
+    if (!child1Rect) return;
+
+    if (node.direction === 'horizontal') {
+      vLines.push({ id: node.id, position: child1Rect.x + child1Rect.width, crossStart: rect.y, crossEnd: rect.y + rect.height });
+    } else {
+      hLines.push({ id: node.id, position: child1Rect.y + child1Rect.height, crossStart: rect.x, crossEnd: rect.x + rect.width });
+    }
+    traverse(node.children[0]);
+    traverse(node.children[1]);
+  }
+
+  traverse(root);
+  return { vLines, hLines };
+}
+
+============================================================
+文件: src/core/types.ts
+============================================================
+export type Direction = 'horizontal' | 'vertical';
+
+export interface Rect {
+  x: number; y: number; width: number; height: number;
+}
+
+// ── 面板实体 ──
+
+
+// ── 1. 静态面板类型配置 (Blueprint/Base Asset) ──
+// 这些数据由组件开发者编写，挂载在 Vue 组件上，全局唯一
+export interface PanelTypeConfig {
+  panelType: string;
+  title: string;
+  icon?: string;
+  
+  // 物理与约束基准
+  defaultWidth: number;
+  defaultHeight: number;
+  minSize: number;
+  maxSize?: number;
+  aspectRatio?: number;
+
+  // 行为权限基准
+  resizable: boolean;
+  draggable: boolean;
+  floatable: boolean;
+  closable: boolean;
+  shared?: boolean;   // 新增：是否启用共享容器
+  syncAll?: boolean;  // 新增：是否默认同步所有顶层 ref
+
+  meta?: Record<string, any>; 
+}
+
+// ── 2. 动态面板实体 (Instance) ──
+// 这些数据是在引擎运行时生成的，代表屏幕上的一个真实面板块
+// ── 2. 动态面板实体 (Instance) ──
+export interface PanelEntity {
+  id: string;          // 实例唯一标识
+  panelType: string;   // 指向其所属的静态配置类型
+  isMaster: boolean;   // 状态：本体还是影子
+  instanceId?: string; // 影子的溯源 ID
+  
+  // 物理与权限的实例级覆盖值 (Overrides)
+  minSize?: number;
+  maxSize?: number;
+  isFixed?: boolean;
+  fixedSize?: number;
+  lockedAtMin?: boolean;
+  resizable?: boolean;
+  draggable?: boolean;
+  floatable?: boolean;
+  closable?: boolean;
+
+  // 👇 新增：运行期专属的临时交互状态
+  ignoreHover?: boolean;
+  ignoreFocus?: boolean;
+
+  // 运行期状态或业务透传数据
+  meta?: Record<string, any>;
+}
+
+// ── 二叉树节点 ──
+export interface LeafNode extends PanelEntity {
+  type: 'leaf';
+}
+
+export interface SplitNode {
+  type: 'split';
+  id: string;
+  direction: Direction;
+  ratio: number;
+  children: [Node, Node];
+}
+
+export type Node = LeafNode | SplitNode;
+
+// ── 自由池节点 ──
+export interface FreePanel {
+  id: string;
+  panel: PanelEntity;
+  x: number; y: number; width: number; height: number;
+  zIndex: number;
+}
+
+export type StashEntry = PanelEntity;
+export type GeometryMap = Map<string, Rect>;
+
+export interface SolverViewport {
+  width: number; height: number;
+}
+
+export interface RenderPipelineConfig {
+  gear: 'eco' | 'balanced' | 'extreme';
+  snapToPixel: boolean;
+}
+
+export interface RenderItem {
+  id: string;
+  node: PanelEntity;
+  rect: Rect;
+  zIndex: number;
+  isFloating: boolean;
+  customClass?: string;
+}
+
+============================================================
+文件: src/index.ts
+============================================================
+// src/index.ts —— Iai 布局引擎统一入口
+
+// 核心引擎
+export { IaiEngine } from './core/IaiEngine';
+
+// 约束求解器（供高级用户直接使用）
+export { resolveConstraint, clampResize } from './core/constraint';
+
+// 渲染适配器 (Vue)
+export { default as IaiLayout } from './renderers/vue/components/IaiLayout.vue';
+export { useEngine, ENGINE_KEY } from './renderers/vue/composables/useIai';
+
+// 🌟 插件统一导出（直接重导出汇总模块）
+export * from './plugins/index';
+
+// 类型导出
+export type * from './core/types';
+
+============================================================
+文件: src/plugins/docking/core.ts
+============================================================
+import type { Rect } from '../../core/types';
+
+export type DropZone = 'center' | 'left' | 'right' | 'top' | 'bottom' | null;
+
+export interface DockingConfig {
+  /** 边缘停靠热区占面板宽高的比例，默认 0.3 */
+  edgeRatio?: number;
+  /** 中心交换热区占面板宽高的比例，默认 0.4 */
+  centerRatio?: number;
+  /** 全局边缘停靠热区阈值（px），默认 120 */
+  globalEdgeThreshold?: number;
+  /** 拖拽移动阈值（px），默认 5 */
+  dragThreshold?: number;
+
+}
+
+export function calculateDropZone(
+  x: number,
+  y: number,
+  rect: Rect,
+  edgeRatio: number = 0.3,
+  centerRatio: number = 0.4
+): DropZone {
+  if (x < rect.x || x > rect.x + rect.width || y < rect.y || y > rect.y + rect.height) {
+    return null;
+  }
+  const xRate = (x - rect.x) / rect.width;
+  const yRate = (y - rect.y) / rect.height;
+
+  if (
+    xRate > edgeRatio && xRate < (1 - edgeRatio) &&
+    yRate > edgeRatio && yRate < (1 - edgeRatio)
+  ) {
+    return 'center';
+  }
+
+  const distLeft = xRate;
+  const distRight = 1 - xRate;
+  const distTop = yRate;
+  const distBottom = 1 - yRate;
+
+  const minDist = Math.min(distLeft, distRight, distTop, distBottom);
+  if (minDist === distTop) return 'top';
+  if (minDist === distBottom) return 'bottom';
+  if (minDist === distLeft) return 'left';
+  return 'right';
+}
+
+============================================================
+文件: src/plugins/docking/index.ts
+============================================================
+import type { IaiPlugin } from '../types';
+import type { IaiEngine } from '../../core/IaiEngine';
+import { dockingPanel } from './operators/dockingPanel';
+import { dockingGlobal } from './operators/dockingGlobal';
+import DockingOverlay from './vue/DockingOverlay.vue';
+import type { DockingConfig } from './core';
+
+export class DockingPlugin implements IaiPlugin {
+  public name = 'DockingPlugin';
+  public overlayComponent = DockingOverlay;
+  public config: DockingConfig;
+
+  constructor(config?: DockingConfig) {
+    this.config = {
+      edgeRatio: 0.3,
+      centerRatio: 0.4,
+      globalEdgeThreshold: 120,
+      dragThreshold: 5,
+      ...config,
+    };
+  }
+
+  install(engine: IaiEngine) {
+    const opPlugin = engine.getPlugins().find((p: any) => p.name === 'OperatorPlugin') as any;
+    if (opPlugin) {
+        opPlugin.register(dockingPanel);
+        opPlugin.register(dockingGlobal);
+    }
+  }
+
+  uninstall(engine: IaiEngine) {
+    const opPlugin = engine.getPlugins().find((p: any) => p.name === 'OperatorPlugin') as any;
+    if (opPlugin) {
+      opPlugin.unregister('docking.panel');
+      opPlugin.unregister('docking.global');
+    }
+  }
+}
+
+============================================================
+文件: src/plugins/docking/operators/dockingGlobal.ts
+============================================================
+// src/plugins/docking/operators/dockingGlobal.ts
+import type { Operator } from '../../operator/types';
+import { dockingState } from '../state';
+
+type EdgeZone = 'left' | 'right' | 'top' | 'bottom';
+
+export const dockingGlobal: Operator = {
+  id: 'docking.global',
+  execute({ engine, props }) {
+    const { sourceId, initialX, initialY } = props;
+    const opPlugin = engine.getPlugins().find((p: any) => p.name === 'OperatorPlugin') as any;
+    // 🌟 1. 获取 Docking 插件实例
+    const dockingPlugin = engine.getPlugins().find((p: any) => p.name === 'DockingPlugin') as any;
+    if (!opPlugin) return;
+
+    // 🌟 2. 读取配置，注入动态阈值
+    const config = dockingPlugin?.config || {};
+    const globalEdgeThreshold = config.globalEdgeThreshold ?? 120;
+    const dragThreshold = config.dragThreshold ?? 5;
+
+    const sourceData = engine.getAny(sourceId);
+    if (!sourceData) return;
+    const realProps = engine.getPanelProps(sourceData);
+    const defaultW = realProps.defaultWidth;
+    const defaultH = realProps.defaultHeight;
+
+    opPlugin.exec('drag.start', {
+      sourceId,
+      initialX,
+      initialY,
+      threshold: dragThreshold, // 🌟 绑定拖拽阈值
+      detectHover: false,
+    });
+
+    let lastZone: EdgeZone | null = null;
+
+    const onMove = (data: any) => {
+      if (data.sourceId !== sourceId) return;
+
+      const localX = data.x;
+      const localY = data.y;
+
+      const vp = engine.getViewport();
+      const containerW = vp.width || window.innerWidth;
+      const containerH = vp.height || window.innerHeight;
+
+      const distLeft = Math.abs(localX);
+      const distRight = Math.abs(localX - containerW);
+      const distTop = Math.abs(localY);
+      const distBottom = Math.abs(localY - containerH);
+
+      const minDist = Math.min(distLeft, distRight, distTop, distBottom);
+      let zone: EdgeZone | null = null;
+
+      // 🌟 3. 使用配置项中的全局边缘阈值
+      if (minDist <= globalEdgeThreshold) {
+        if (minDist === distLeft) zone = 'left';
+        else if (minDist === distRight) zone = 'right';
+        else if (minDist === distTop) zone = 'top';
+        else if (minDist === distBottom) zone = 'bottom';
+      }
+
+      lastZone = zone;
+      dockingState.zone = zone;
+      dockingState.rect = zone
+        ? getEdgeRect(zone, containerW, containerH, defaultW, defaultH)
+        : null;
+    };
+
+    const onEnd = () => {
+      dockingState.zone = null;
+      dockingState.rect = null;
+      if (lastZone) {
+        executeGlobalDocking(engine, sourceId, lastZone);
+      }
+      engine.events.off('drag:move', onMove);
+      engine.events.off('drag:end', onEnd);
+    };
+
+    engine.events.on('drag:move', onMove);
+    engine.events.on('drag:end', onEnd);
+  },
+};
+
+// ── 辅助函数 ──
+
+function getEdgeRect(zone: EdgeZone, containerW: number, containerH: number, defaultW?: number, defaultH?: number) {
+  const targetW = defaultW ? Math.min(defaultW, containerW * 0.5) : containerW * 0.2;
+  const targetH = defaultH ? Math.min(defaultH, containerH * 0.5) : containerH * 0.2;
+  if (zone === 'left') return { x: 0, y: 0, width: targetW, height: containerH };
+  if (zone === 'right') return { x: containerW - targetW, y: 0, width: targetW, height: containerH };
+  if (zone === 'top') return { x: 0, y: 0, width: containerW, height: targetH };
+  if (zone === 'bottom') return { x: 0, y: containerH - targetH, width: containerW, height: targetH };
+  return null;
+}
+
+function executeGlobalDocking(engine: any, sourceId: string, zone: EdgeZone) {
+  const sourceData = engine.getAny(sourceId);
+  if (!sourceData) return;
+  engine.getFree(sourceId) ? engine.removeFree(sourceId) : engine.deleteNode(sourceId);
+  const direction = zone === 'left' || zone === 'right' ? 'horizontal' : 'vertical';
+  const insertAsSecond = zone === 'right' || zone === 'bottom';
+  const newLeaf = { ...sourceData, type: 'leaf' };
+  const root = engine.getRoot();
+  if (!root) { engine.mount(newLeaf, true); return; }
+  const layoutEl = document.querySelector('.iai-layout-container');
+  const containerW = layoutEl?.clientWidth || window.innerWidth;
+  const containerH = layoutEl?.clientHeight || window.innerHeight;
+  const realProps = engine.getPanelProps(sourceData);
+  let ratio = 0.5;
+  if (direction === 'horizontal') {
+    const targetW = realProps.defaultWidth ? Math.min(realProps.defaultWidth, containerW * 0.5) : containerW * 0.2;
+    ratio = targetW / containerW;
+  } else {
+    const targetH = realProps.defaultHeight ? Math.min(realProps.defaultHeight, containerH * 0.5) : containerH * 0.2;
+    ratio = targetH / containerH;
+  }
+  engine.mount({ type: 'split', id: `split-${Date.now()}`, direction, ratio: insertAsSecond ? 1 - ratio : ratio, children: insertAsSecond ? [root, newLeaf] : [newLeaf, root] }, true);
+}
+
+============================================================
+文件: src/plugins/docking/operators/dockingPanel.ts
+============================================================
+// src/plugins/docking/operators/dockingPanel.ts
+import type { Operator } from '../../operator/types';
+import { calculateDropZone, type DropZone } from '../core';
+import { dockingState } from '../state';
+import type { Rect } from '../../../core/types';
+
+export const dockingPanel: Operator = {
+  id: 'docking.panel',
+  execute({ engine, props }) {
+    const { sourceId, initialX, initialY } = props;
+    const opPlugin = engine.getPlugins().find((p: any) => p.name === 'OperatorPlugin') as any;
+    // 🌟 1. 获取 Docking 插件实例，以便读取配置
+    const dockingPlugin = engine.getPlugins().find((p: any) => p.name === 'DockingPlugin') as any;
+    
+    if (!opPlugin) return;
+    
+    // 🌟 2. 提取配置，提供安全兜底默认值
+    const config = dockingPlugin?.config || {};
+    const dragThreshold = config.dragThreshold ?? 5;
+    const edgeRatio = config.edgeRatio ?? 0.3;
+    const centerRatio = config.centerRatio ?? 0.4;
+
+    opPlugin.exec('drag.start', {
+      sourceId,
+      initialX,
+      initialY,
+      threshold: dragThreshold, // 🌟 绑定拖拽阈值
+      detectHover: true,
+    });
+    
+    let lastZone: DropZone = null;
+    let lastTargetId: string | null = null;
+    
+    const onMove = (data: any) => {
+      if (data.sourceId !== sourceId) return;
+      const hoveredId = data.hoveredPanelId;
+      
+      if (!hoveredId || hoveredId === sourceId) {
+        dockingState.targetId = null;
+        dockingState.zone = null;
+        dockingState.rect = null;
+        lastZone = null;
+        lastTargetId = null;
+        return;
+      }
+
+      const targetRect = getTargetRect(engine, hoveredId);
+      if (!targetRect) return;
+
+      // 🌟 3. 将比例配置传入五宫格计算函数
+      const zone = calculateDropZone(data.x, data.y, targetRect, edgeRatio, centerRatio);
+      lastZone = zone;
+      lastTargetId = hoveredId;
+      dockingState.targetId = hoveredId;
+      dockingState.zone = zone;
+      
+      // 🌟 4. 由操作符利用配置比例计算精确矩形
+      dockingState.rect = getExactHighlightRect(targetRect, zone, edgeRatio, centerRatio);
+    };
+
+    const onEnd = () => {
+      dockingState.targetId = null;
+      dockingState.zone = null;
+      dockingState.rect = null;
+      if (lastZone && lastTargetId) {
+        executePanelDocking(engine, sourceId, lastTargetId, lastZone, edgeRatio);
+      }
+      engine.events.off('drag:move', onMove);
+      engine.events.off('drag:end', onEnd);
+    };
+
+    engine.events.on('drag:move', onMove);
+    engine.events.on('drag:end', onEnd);
+  },
+};
+
+// ── 辅助函数 ──
+
+/** 🌟 核心改进：根据传入的 edgeRatio 和 centerRatio 动态计算高亮像素 */
+function getExactHighlightRect(rect: Rect, zone: DropZone, edgeRatio: number, centerRatio: number): Rect {
+  if (zone === 'center' || !zone) {
+    // 按照 centerRatio 比例居中计算矩形（例如 0.4 就是长宽都占 40%，并居中）
+    const w = rect.width * centerRatio;
+    const h = rect.height * centerRatio;
+    return {
+      x: rect.x + (rect.width - w) / 2,
+      y: rect.y + (rect.height - h) / 2,
+      width: w,
+      height: h
+    };
+  }
+  
+  let { x, y, width, height } = rect;
+  
+  // 按照 edgeRatio 计算边缘高亮矩形（例如 0.3 就是占边长的 30%）
+  if (zone === 'left') { width *= edgeRatio; }
+  if (zone === 'right') { width *= edgeRatio; x += rect.width - width; }
+  if (zone === 'top') { height *= edgeRatio; }
+  if (zone === 'bottom') { height *= edgeRatio; y += rect.height - height; }
+  
+  return { x, y, width, height };
+}
+
+function getTargetRect(engine: any, id: string) {
+  const vp = engine.getViewport();
+  const geoMap = engine.getGeoMap(vp.width || window.innerWidth, vp.height || window.innerHeight);
+  const gridRect = geoMap.get(id);
+  if (gridRect) return gridRect;
+  
+  const free = engine.getFree(id);
+  if (free) return { x: free.x, y: free.y, width: free.width, height: free.height };
+
+  return null;
+}
+
+function executePanelDocking(engine: any, sourceId: string, targetId: string, zone: DropZone, edgeRatio: number) {
+  const opPlugin = engine.getPlugins().find((p: any) => p.name === 'OperatorPlugin') as any;
+  if (!opPlugin) return;
+
+  if (zone === 'center') {
+    const src = engine.getAny(sourceId), tgt = engine.getAny(targetId);
+    if (!src || !tgt) return;
+    const srcType = src.panelType;
+    opPlugin.exec('panel.switch', { targetId: sourceId, newType: tgt.panelType });
+    opPlugin.exec('panel.switch', { targetId: targetId, newType: srcType });
+    return;
+  }
+
+  const sourceData = engine.getAny(sourceId);
+  if (!sourceData) return;
+  engine.getFree(sourceId) ? engine.removeFree(sourceId) : engine.deleteNode(sourceId);
+
+  const direction = (zone === 'left' || zone === 'right') ? 'horizontal' : 'vertical';
+  const insertAsSecond = (zone === 'right' || zone === 'bottom');
+  
+  const newLeaf = { ...sourceData, type: 'leaf' };
+  
+  // 🌟 面板切分比例，保持 0.5 对半分，这样 UI 最美观
+  engine.splitNode(targetId, direction, 0.5, newLeaf, insertAsSecond);
+}
+
+============================================================
+文件: src/plugins/docking/state.ts
+============================================================
+import { reactive } from 'vue';
+
+export const dockingState = reactive<{
+  targetId: string | null;
+  zone: string | null;
+  rect: { x: number; y: number; width: number; height: number } | null;
+}>({
+  targetId: null,
+  zone: null,
+  rect: null,
+});
+
+============================================================
+文件: src/plugins/docking/vue/DockingOverlay.vue
+============================================================
+<template>
+  <div class="docking-highlight-overlay">
+    <div
+      v-if="dockingState.rect"
+      class="docking-highlight"
+      :class="dockingState.zone ? `zone-${dockingState.zone}` : ''"
+      :style="highlightStyle"
+    >
+      <div class="visual"></div>
+    </div>
+  </div>
+</template>
+
+<script setup lang="ts">
+import { computed } from 'vue';
+import { dockingState } from '../state';
+
+// 🌟 核心改进：视图层变得极度纯粹。不再有 width /= 2 的判断。
+// 操作符传过来精确到像素的 x, y, width, height，这里直接渲染。
+const highlightStyle = computed(() => {
+  const rect = dockingState.rect;
+  if (!rect) return { display: 'none' as const };
+
+  return {
+    left: `${rect.x}px`,
+    top: `${rect.y}px`,
+    width: `${rect.width}px`,
+    height: `${rect.height}px`,
+  };
+});
+</script>
+
+<style scoped>
+.docking-highlight-overlay {
+  position: absolute; inset: 0;
+  pointer-events: none; z-index: 10001;
+}
+.docking-highlight {
+  position: absolute; transition: all 0.1s ease-out; box-sizing: border-box; padding: 3px;
+}
+.visual {
+  width: 100%; height: 100%;
+  background-color: rgba(0, 127, 212, 0.35);
+  border: 2px solid #007fd4;
+  border-radius: 4px;
+}
+.zone-center .visual {
+  background-color: rgba(148, 0, 211, 0.25);
+  border-color: #9400d3;
+}
+</style>
+
+============================================================
+文件: src/plugins/domino/core.ts
+============================================================
+// src/plugins/domino/core.ts
+import type { Node, Rect, GeometryMap, LeafNode } from '../../core/types';
+import type { OrthogonalGrid, GridLine } from '../../core/solver';
+
+export type DragMode = 'domino' | 'simple' | 'magnetic';
+
+export interface DominoConfig {
+  fpsLimit: number;
+  deadzone: number;
+  clampToViewport: boolean;
+  rigidClamp: boolean;
+  zIndexBase: number;
+  mode?: 'domino' | 'simple' | 'magnetic';
+  snapToMin?: boolean;
+}
+
+export interface DragContext {
+  splitId: string;
+  direction: 'horizontal' | 'vertical';
+  initialPositions: Map<string, number>;
+  viewportWidth: number;
+  viewportHeight: number;
+  leafPanels: BoundPanel[];
+  config: DominoConfig;
+  mode: DragMode;
+  edges: { from: string; to: string; weight: number }[];
+}
+
+export interface BoundPanel {
+  id: string;
+  minSize: number;
+  leftLineId: string | null;
+  rightLineId: string | null;
+  topLineId: string | null;
+  bottomLineId: string | null;
+}
+
+function getLongestPath(sourceId: string, edges: { from: string; to: string; weight: number }[]): Map<string, number> {
+  const dist = new Map<string, number>();
+  dist.set(sourceId, 0);
+  const V = edges.length + 2; 
+  for (let i = 0; i < V; i++) {
+    let updated = false;
+    for (const e of edges) {
+      if (dist.has(e.from)) {
+        const d = dist.get(e.from)! + e.weight;
+        if (!dist.has(e.to) || d > dist.get(e.to)!) {
+          dist.set(e.to, d);
+          updated = true;
+        }
+      }
+    }
+    if (!updated) break;
+  }
+  return dist;
+}
+
+export function createDragContext(
+  tree: Node,
+  splitId: string,
+  viewport: { width: number; height: number },
+  geometryMap: GeometryMap,
+  grid: OrthogonalGrid,
+  config: DominoConfig,
+  mode: DragMode,
+  getProps: (node: LeafNode) => any // 🌟 唯一修改：接收引擎属性
+): DragContext | null {
+  const initialPositions = new Map<string, number>();
+  grid.vLines.forEach(l => initialPositions.set(l.id, l.position));
+  grid.hLines.forEach(l => initialPositions.set(l.id, l.position));
+
+  const isVerticalLine = grid.vLines.some(l => l.id === splitId);
+  const direction = isVerticalLine ? 'horizontal' : 'vertical';
+  const leafPanels: BoundPanel[] = [];
+
+  const getBestLine = (lines: GridLine[], pos: number, crossStart: number, crossEnd: number) => {
+    const TOLERANCE = 1;
+    const matches = lines.filter(l => Math.abs(l.position - pos) < TOLERANCE && Math.max(l.crossStart, crossStart) < Math.min(l.crossEnd, crossEnd));
+    if (matches.length === 0) return null;
+    matches.sort((a, b) => (a.crossEnd - a.crossStart) - (b.crossEnd - b.crossStart));
+    return matches[0];
+  };
+
+  function collectBoundPanels(node: Node) {
+    if (node.type === 'leaf') {
+      const rect = geometryMap.get(node.id);
+      if (!rect) return;
+      leafPanels.push({
+        id: node.id,
+        // 🌟 唯一修改：获取真实属性
+        minSize: getProps(node as LeafNode).minSize ?? 40,
+        leftLineId: getBestLine(grid.vLines, rect.x, rect.y, rect.y + rect.height)?.id || null,
+        rightLineId: getBestLine(grid.vLines, rect.x + rect.width, rect.y, rect.y + rect.height)?.id || null,
+        topLineId: getBestLine(grid.hLines, rect.y, rect.x, rect.x + rect.width)?.id || null,
+        bottomLineId: getBestLine(grid.hLines, rect.y + rect.height, rect.x, rect.x + rect.width)?.id || null,
+      });
+      return;
+    }
+    collectBoundPanels(node.children[0]);
+    collectBoundPanels(node.children[1]);
+  }
+  collectBoundPanels(tree);
+
+  let edges = leafPanels.map(p => ({
+    from: direction === 'horizontal' ? (p.leftLineId || 'START') : (p.topLineId || 'START'),
+    to: direction === 'horizontal' ? (p.rightLineId || 'END') : (p.bottomLineId || 'END'),
+    weight: p.minSize
+  }));
+
+  const totalDist = getLongestPath('START', edges).get('END') ?? 0;
+  const maxBound = direction === 'horizontal' ? viewport.width : viewport.height;
+  if (totalDist > maxBound && maxBound > 0) {
+    const scale = maxBound / totalDist;
+    edges = edges.map(e => ({ ...e, weight: e.weight * scale }));
+  }
+
+  return { splitId, direction, initialPositions, viewportWidth: viewport.width, viewportHeight: viewport.height, leafPanels, config, mode, edges };
+}
+
+export function simulatePush(ctx: DragContext, intendedDelta: number): { positions: Map<string, number>; blocked: boolean } {
+  const positions = new Map(ctx.initialPositions);
+  const { splitId, direction, viewportWidth, viewportHeight, edges, initialPositions } = ctx;
+  const maxBound = direction === 'horizontal' ? viewportWidth : viewportHeight;
+
+  const distFromStart = getLongestPath('START', edges);
+  const distFromSplit = getLongestPath(splitId, edges);
+
+  const reverseEdges = edges.map(e => ({ from: e.to, to: e.from, weight: e.weight }));
+  const distFromEndRev = getLongestPath('END', reverseEdges);
+  const distFromSplitRev = getLongestPath(splitId, reverseEdges);
+
+  const minAllowed = distFromStart.get(splitId) ?? 0;
+  const maxAllowed = maxBound - (distFromEndRev.get(splitId) ?? 0);
+
+  const initialPos = initialPositions.get(splitId)!;
+  const targetPos = initialPos + intendedDelta;
+  let clampedPos = targetPos;
+
+  if (ctx.mode === 'simple') {
+    let simpleMin = 0;
+    let simpleMax = maxBound;
+    edges.forEach(e => {
+      if (e.to === splitId) {
+        const limit = (e.from === 'START' ? 0 : initialPositions.get(e.from)!) + e.weight;
+        if (limit > simpleMin) simpleMin = limit;
+      }
+      if (e.from === splitId) {
+        const limit = (e.to === 'END' ? maxBound : initialPositions.get(e.to)!) - e.weight;
+        if (limit < simpleMax) simpleMax = limit;
+      }
+    });
+    clampedPos = Math.max(Math.max(simpleMin, minAllowed), Math.min(Math.min(simpleMax, maxAllowed), targetPos));
+    positions.set(splitId, clampedPos);
+  } else {
+    clampedPos = Math.max(minAllowed, Math.min(maxAllowed, targetPos));
+    positions.set(splitId, clampedPos);
+
+    if (clampedPos > initialPos) {
+      distFromSplit.forEach((dist, nodeId) => {
+        if (nodeId !== 'START' && nodeId !== 'END' && nodeId !== splitId) {
+          const currentP = initialPositions.get(nodeId)!;
+          const pushedP = clampedPos + dist;
+          if (pushedP > currentP) positions.set(nodeId, pushedP);
+        }
+      });
+    } else if (clampedPos < initialPos) {
+      distFromSplitRev.forEach((dist, nodeId) => {
+        if (nodeId !== 'START' && nodeId !== 'END' && nodeId !== splitId) {
+          const currentP = initialPositions.get(nodeId)!;
+          const pushedP = clampedPos - dist;
+          if (pushedP < currentP) positions.set(nodeId, pushedP);
+        }
+      });
+    }
+  }
+
+  return { positions, blocked: clampedPos !== targetPos };
+}
+
+export function rebuildTreeRatios(node: Node, rect: Rect, linePositions: Map<string, number>, ctx: DragContext): Node {
+  if (node.type === 'leaf') return { ...node };
+  
+  const pos = linePositions.get(node.id);
+  let ratio = node.ratio;
+  let rect1: Rect, rect2: Rect;
+  
+  if (node.direction === 'horizontal') {
+    if (pos !== undefined && ctx.direction === 'horizontal') {
+      const leftWidth = pos - rect.x;
+      ratio = rect.width > 0 ? leftWidth / rect.width : 0.5;
+    }
+    ratio = Math.max(0, Math.min(1, ratio));
+    const leftW = Math.round(rect.width * ratio);
+    rect1 = { x: rect.x, y: rect.y, width: leftW, height: rect.height };
+    rect2 = { x: rect.x + leftW, y: rect.y, width: rect.width - leftW, height: rect.height };
+  } else {
+    if (pos !== undefined && ctx.direction === 'vertical') {
+      const topHeight = pos - rect.y;
+      ratio = rect.height > 0 ? topHeight / rect.height : 0.5;
+    }
+    ratio = Math.max(0, Math.min(1, ratio));
+    const topH = Math.round(rect.height * ratio);
+    rect1 = { x: rect.x, y: rect.y, width: rect.width, height: topH };
+    rect2 = { x: rect.x, y: rect.y + topH, width: rect.width, height: rect.height - topH };
+  }
+
+  return {
+    ...node,
+    ratio,
+    children: [
+      rebuildTreeRatios(node.children[0], rect1, linePositions, ctx),
+      rebuildTreeRatios(node.children[1], rect2, linePositions, ctx),
+    ],
+  } as Node;
+}
+
+export function unlockAndSyncRatios(
+  node: Node,
+  affectedIds: Set<string>,
+  geoMap: GeometryMap
+): Node {
+  if (node.type === 'leaf') {
+    const n = node as any;
+    if (affectedIds.has(n.id) && n.isFixed) {
+      return { ...node, isFixed: false, fixedSize: undefined } as Node;
+    }
+    return node;
+  }
+
+  const child1 = node.children[0];
+  const child2 = node.children[1];
+  const c1Rect = geoMap.get(child1.id);
+  const c2Rect = geoMap.get(child2.id);
+
+  let exactRatio = node.ratio;
+  if (c1Rect && c2Rect) {
+    if (node.direction === 'horizontal') {
+      const totalW = c1Rect.width + c2Rect.width;
+      if (totalW > 0) exactRatio = c1Rect.width / totalW;
+    } else {
+      const totalH = c1Rect.height + c2Rect.height;
+      if (totalH > 0) exactRatio = c1Rect.height / totalH;
+    }
+  }
+
+  return {
+    ...node,
+    ratio: exactRatio,
+    children: [
+      unlockAndSyncRatios(child1, affectedIds, geoMap),
+      unlockAndSyncRatios(child2, affectedIds, geoMap)
+    ]
+  } as Node;
+}
+
+============================================================
+文件: src/plugins/domino/index.ts
+============================================================
+// src/plugins/domino/index.ts
+import type { IaiPlugin } from '../types';
+import type { IaiEngine } from '../../core/IaiEngine';
+import DominoOverlay from './vue/DominoOverlay.vue';
+import type { DominoConfig } from './core';
+
+export class DominoPlugin implements IaiPlugin {
+  public name = 'DominoPlugin';
+  public overlayComponent = DominoOverlay;
+  public config: DominoConfig;
+
+  constructor(config?: Partial<DominoConfig>) {
+    this.config = {
+      fpsLimit: 60,
+      deadzone: 1.5,
+      clampToViewport: true,
+      rigidClamp: true,
+      zIndexBase: 10,
+      mode: 'domino', 
+      snapToMin: true,
+
+      ...config,
+    };
+  }
+
+  install(_engine: IaiEngine) {
+    // 所有逻辑在 overlay 组件中
+  }
+
+  uninstall() {
+    // 清理由 overlay 组件的 onUnmounted 处理
+  }
+}
+
+============================================================
+文件: src/plugins/domino/types.ts
+============================================================
+
+
+============================================================
+文件: src/plugins/domino/vue/DominoOverlay.vue
+============================================================
+<template>
+  <div ref="containerRef" class="domino-overlay" :style="{ zIndex: dominoZIndex }">
+    <div
+      v-if="isDragging"
+      class="drag-shield"
+      :style="{ cursor: activeDirection === 'vertical' ? 'col-resize' : 'row-resize' }"
+    ></div>
+
+    <div
+      v-for="line in gridLines.vLines"
+      v-show="line.resizable"
+      :key="'dv-' + line.id"
+      class="drag-handle vertical"
+      :class="{ 'is-active': activeSplitId === line.id }"
+      :data-grid-index="line.index" 
+      :data-first="line.isFirst || undefined"
+      :data-last="line.isLast || undefined"
+      :style="getHandleStyle(line, 'vertical')"
+      @pointerdown.prevent="startDrag(line.id, 'vertical', $event)"
+    />
+
+    <div
+      v-for="line in gridLines.hLines"
+      v-show="line.resizable"
+      :key="'dh-' + line.id"
+      class="drag-handle horizontal"
+      :class="{ 'is-active': activeSplitId === line.id }"
+      :data-grid-index="line.index"
+      :data-first="line.isFirst || undefined"
+      :data-last="line.isLast || undefined"
+      :style="getHandleStyle(line, 'horizontal')"
+      @pointerdown.prevent="startDrag(line.id, 'horizontal', $event)"
+    />
+    
+  </div>
+</template>
+
+<script setup lang="ts">
+import { ref, onMounted, onUnmounted, computed } from 'vue';
+import { useEngine } from '../../../renderers/vue/composables/useIai';
+import {
+  createDragContext,
+  simulatePush,
+  rebuildTreeRatios,
+  unlockAndSyncRatios,
+  type DragContext,
+  type DragMode
+} from '../core';
+import type { DominoPlugin } from '../index';
+
+const engine = useEngine();
+const containerRef = ref<HTMLElement | null>(null);
+const viewport = ref({ width: 0, height: 0 });
+
+const isDragging = ref(false);
+const dragMode = computed(() => dominoPlugin.config.mode || 'domino');
+const activeSplitId = ref<string | null>(null);
+const activeDirection = ref<'horizontal' | 'vertical' | null>(null);
+
+const dominoPlugin = engine.getPlugins().find(p => p.name === 'DominoPlugin') as DominoPlugin;
+
+const gridLines = ref<{
+  vLines: Array<{
+    id: string;
+    position: number;
+    crossStart: number;
+    crossEnd: number;
+    resizable: boolean;
+    index: number;
+    isFirst: boolean;
+    isLast: boolean; 
+  }>;
+  hLines: Array<{
+    id: string;
+    position: number;
+    crossStart: number;
+    crossEnd: number;
+    resizable: boolean;
+    index: number;
+    isFirst: boolean;
+    isLast: boolean; 
+  }>;
+}>({ vLines: [], hLines: [] });
+
+const updateOverlay = () => {
+  if (!containerRef.value || !engine.getRoot()) return;
+  const rect = containerRef.value.getBoundingClientRect();
+  viewport.value = { width: rect.width, height: rect.height };
+  const geoMap = engine.getGeoMap(rect.width, rect.height);
+  const rawGrid = engine.getGridLines(geoMap);
+
+  const root = engine.getRoot();
+  
+  // 🌟 修正 1：一次性遍历树，构建 resizable 映射表，彻底干掉 O(N^2) 的嵌套 DFS 循环
+  const resizableMap = new Map<string, boolean>();
+  const traverse = (node: any) => {
+    if (!node) return;
+    resizableMap.set(node.id, node.resizable !== false);
+    if (node.children) {
+      traverse(node.children[0]);
+      traverse(node.children[1]);
+    }
+  };
+  traverse(root);
+
+  // 🌟 修正 2：强制按绝对物理坐标排序，保证 index 永远匹配视觉顺序！
+  const sortedVLines = [...rawGrid.vLines].sort((a, b) => a.position - b.position);
+  const sortedHLines = [...rawGrid.hLines].sort((a, b) => a.position - b.position);
+
+  const vLen = sortedVLines.length;
+  const hLen = sortedHLines.length;
+
+  gridLines.value = {
+    vLines: sortedVLines.map((line, index) => ({
+      ...line,
+      resizable: resizableMap.has(line.id) ? resizableMap.get(line.id)! : true,
+      index, // 现在的 index 是绝对准确的视觉索引
+      isFirst: index === 0,
+      isLast: index === vLen - 1,
+    })),
+    hLines: sortedHLines.map((line, index) => ({
+      ...line,
+      resizable: resizableMap.has(line.id) ? resizableMap.get(line.id)! : true,
+      index,
+      isFirst: index === 0,
+      isLast: index === hLen - 1,
+    })),
+  };
+};
+
+const dominoZIndex = computed(() => dominoPlugin.config.zIndexBase);
+
+let resizeObserver: ResizeObserver | null = null;
+onMounted(() => {
+  if (containerRef.value) {
+    resizeObserver = new ResizeObserver(updateOverlay);
+    resizeObserver.observe(containerRef.value);
+  }
+  engine.events.on('tree:update', updateOverlay);
+  updateOverlay();
+});
+
+onUnmounted(() => {
+  resizeObserver?.disconnect();
+  engine.events.off('tree:update', updateOverlay);
+});
+
+let activeCtx: DragContext | null = null;
+let rafId: number | null = null;
+let startX = 0, startY = 0;
+let lastFrameTime = 0;
+let lastProcessedDelta = 0;
+
+const startDrag = (splitId: string, direction: 'horizontal' | 'vertical', e: PointerEvent) => {
+  const elemBelow = document.elementFromPoint(e.clientX, e.clientY);
+  if (elemBelow?.closest?.('.iai-flat-node.is-floating')) {
+    return; 
+  }
+
+  const rootTree = engine.getRoot();
+  if (!rootTree || !containerRef.value) return;
+
+  const geoMap = engine.getGeoMap(viewport.value.width, viewport.value.height);
+  
+  const pureGrid = {
+    vLines: gridLines.value.vLines.map(({ resizable, ...rest }) => rest),
+    hLines: gridLines.value.hLines.map(({ resizable, ...rest }) => rest),
+  };
+
+  activeCtx = createDragContext(
+    rootTree, splitId, viewport.value, geoMap, pureGrid, dominoPlugin.config, dragMode.value,
+    (node: any) => engine.getPanelProps(node)
+  );
+  if (!activeCtx) return;
+
+  if (dominoPlugin.config.rigidClamp) {
+    const affectedIds = new Set<string>();
+    for (const panel of activeCtx.leafPanels) {
+      if (
+        panel.leftLineId === splitId ||
+        panel.rightLineId === splitId ||
+        panel.topLineId === splitId ||
+        panel.bottomLineId === splitId
+      ) {
+        affectedIds.add(panel.id);
+      }
+    }
+
+    let needsUnlock = false;
+    for (const id of affectedIds) {
+      const node = engine.getNode(id);
+      if (node && (node as any).isFixed) {
+        needsUnlock = true;
+        break;
+      }
+    }
+
+    if (needsUnlock) {
+      const newTree = unlockAndSyncRatios(rootTree, affectedIds, geoMap);
+      engine.mount(newTree, true);
+      const updatedGeoMap = engine.getGeoMap(viewport.value.width, viewport.value.height);
+      activeCtx = createDragContext(
+        newTree, splitId, viewport.value, updatedGeoMap, pureGrid, dominoPlugin.config, dragMode.value,
+        (node: any) => engine.getPanelProps(node)
+      );
+      if (!activeCtx) return;
+    }
+  }
+
+  isDragging.value = true;
+  activeSplitId.value = splitId;
+  activeDirection.value = direction;
+
+  const rect = containerRef.value.getBoundingClientRect();
+  startX = e.clientX - rect.left;
+  startY = e.clientY - rect.top;
+
+  lastFrameTime = performance.now();
+  lastProcessedDelta = 0;
+
+  window.addEventListener('pointermove', onDragMove);
+  window.addEventListener('pointerup', onDragEnd);
+};
+
+const onDragMove = (e: PointerEvent) => {
+  if (!activeCtx || !isDragging.value || !containerRef.value) return;
+  e.preventDefault();
+  
+  const now = performance.now();
+  if (now - lastFrameTime < 1000 / dominoPlugin.config.fpsLimit) return;
+
+  const rect = containerRef.value.getBoundingClientRect();
+  const localX = e.clientX - rect.left;
+  const localY = e.clientY - rect.top;
+
+  const clampedX = Math.max(0, Math.min(localX, viewport.value.width));
+  const clampedY = Math.max(0, Math.min(localY, viewport.value.height));
+
+  const intendedDelta = activeCtx.direction === 'horizontal' ? clampedX - startX : clampedY - startY;
+  
+  if (Math.abs(intendedDelta - lastProcessedDelta) < dominoPlugin.config.deadzone) return;
+
+  lastFrameTime = now;
+  lastProcessedDelta = intendedDelta;
+
+  if (!rafId) {
+    rafId = requestAnimationFrame(() => {
+      if (!activeCtx) return;
+
+    let result;
+
+    if (dominoPlugin.config.mode === 'magnetic') {
+      const snapCtx = { ...activeCtx, mode: 'simple' as DragMode };
+      result = simulatePush(snapCtx, intendedDelta);
+
+      const dir = activeCtx.direction;
+      const linePos = result.positions.get(activeCtx.splitId);
+      if (linePos !== undefined) {
+        for (const panel of activeCtx.leafPanels) {
+          let isLeftOrTop = false;
+          let otherLineId: string | null = null;
+
+          if (dir === 'horizontal' && panel.leftLineId === activeCtx.splitId) {
+            isLeftOrTop = true; otherLineId = panel.rightLineId;
+          } else if (dir === 'horizontal' && panel.rightLineId === activeCtx.splitId) {
+            isLeftOrTop = false; otherLineId = panel.leftLineId;
+          } else if (dir === 'vertical' && panel.topLineId === activeCtx.splitId) {
+            isLeftOrTop = true; otherLineId = panel.bottomLineId;
+          } else if (dir === 'vertical' && panel.bottomLineId === activeCtx.splitId) {
+            isLeftOrTop = false; otherLineId = panel.topLineId;
+          } else {
+            continue;
+          }
+
+          const node = engine.getNode(panel.id);
+          const props = node ? engine.getPanelProps(node) : null;
+          const threshold = props?.meta?.snapThreshold ?? 0;
+          const otherPos = otherLineId
+            ? result.positions.get(otherLineId)
+            : (isLeftOrTop ? activeCtx.viewportWidth : 0);
+          if (otherPos === undefined) continue;
+
+          const currentSize = isLeftOrTop ? otherPos - linePos : linePos - otherPos;
+          if (Math.abs(currentSize - panel.minSize) < threshold) {
+            const correctedPos = isLeftOrTop ? otherPos - panel.minSize : otherPos + panel.minSize;
+            result.positions.set(activeCtx.splitId, correctedPos);
+            break;
+          }
+        }
+      }
+    } else {
+      result = simulatePush(activeCtx, intendedDelta);
+    }
+
+      const rootRect = { x: 0, y: 0, width: activeCtx.viewportWidth, height: activeCtx.viewportHeight };
+      const newTree = rebuildTreeRatios(engine.getRoot()!, rootRect, result.positions, activeCtx);
+      engine.mount(newTree, true);
+      rafId = null;
+    });
+  }
+};
+
+const onDragEnd = () => {
+  if (dominoPlugin.config.rigidClamp && activeCtx) {
+    const allNodes = engine.getAllNodes();
+    const geoMap = engine.getGeoMap(viewport.value.width, viewport.value.height);
+    const currentDirection = activeCtx.direction;
+
+    for (const node of allNodes) {
+      const rect = geoMap.get(node.id);
+      const realProps = engine.getPanelProps(node);
+      if (rect && realProps.minSize !== undefined) {
+        const actualSize = currentDirection === 'horizontal' ? rect.width : rect.height;
+        const isAtMin = Math.abs(actualSize - realProps.minSize) < 1;
+        if (isAtMin && !node.isFixed) {
+          engine.replace(node.id, {
+            ...node,
+            isFixed: true,
+            fixedSize: realProps.minSize,
+          });
+        }
+      }
+    }
+  }
+
+  isDragging.value = false;
+  activeSplitId.value = null;
+  activeDirection.value = null;
+  activeCtx = null;
+  window.removeEventListener('pointermove', onDragMove);
+  window.removeEventListener('pointerup', onDragEnd);
+  if (rafId) {
+    cancelAnimationFrame(rafId);
+    rafId = null;
+  }
+};
+
+const getHandleStyle = (line: any, dir: 'vertical' | 'horizontal') => {
+  if (dir === 'vertical') {
+    return {
+      left: `${line.position}px`,
+      top: `${line.crossStart}px`,
+      height: `${line.crossEnd - line.crossStart}px`,
+    };
+  } else {
+    return {
+      top: `${line.position}px`,
+      left: `${line.crossStart}px`,
+      width: `${line.crossEnd - line.crossStart}px`,
+    };
+  }
+};
+
+</script>
+
+<style scoped>
+.domino-overlay {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+.drag-shield {
+  position: absolute;
+  inset: 0;
+  z-index: 9998;
+  pointer-events: auto;
+}
+.drag-handle {
+  position: absolute;
+  pointer-events: auto;
+  z-index: 100;
+  transition: background-color 0.15s ease;
+}
+/* 默认好看的样式 */
+.drag-handle {
+  background-color: transparent;
+}
+.drag-handle:hover {
+  background-color: rgba(0, 127, 212, 0.15);
+}
+.drag-handle.is-active {
+  background-color: rgba(0, 127, 212, 0.35) !important;
+}
+/* 垂直线 */
+.drag-handle.vertical {
+  width: 7px;
+  margin-left: -3.5px;
+  cursor: col-resize;
+}
+/* 水平线 */
+.drag-handle.horizontal {
+  height: 7px;
+  margin-top: -3.5px;
+  cursor: row-resize;
+}
+.domino-overlay:has(.drag-shield) .drag-handle:not(.is-active) {
+  pointer-events: none;
+}
+</style>
+
+============================================================
+文件: src/plugins/float-resize/config.ts
+============================================================
+// src/plugins/float-resize/config.ts
+
+export interface FloatResizeConfig {
+  /** 物理把手热区的粗细/大小（px），用于计算可点击区域的宽度 */
+  handleSize: number;
+  /** 是否启用智能参考线吸附 */
+  enableSnap: boolean;
+  /** 吸附阈值（px） */
+  snapThreshold: number;
+  /** 是否仅使用右下角模式（关闭八向把手） */
+  cornerOnly: boolean;
+}
+
+export const DEFAULT_FLOAT_RESIZE_CONFIG: FloatResizeConfig = {
+  handleSize: 5,   // 热区放宽到 10px，更容易点中
+  enableSnap: true,
+  snapThreshold: 50,
+  cornerOnly: true,
+};
+
+============================================================
+文件: src/plugins/float-resize/core.ts
+============================================================
+// src/plugins/float-resize/core.ts
+import { clampResize } from '../../core/constraint';
+import type { Rect } from '../../core/types';
+
+export type ResizeDirection = 'n' | 's' | 'e' | 'w' | 'nw' | 'ne' | 'sw' | 'se';
+
+export interface SnappedResizeOptions {
+  startRect: Rect;
+  boundary: Rect;
+  guides: { top?: number; bottom?: number; left?: number; right?: number };
+  handle: ResizeDirection;
+  deltaX: number;
+  deltaY: number;
+  minSize: number;
+  enableSnap: boolean;
+  snapThreshold: number;
+}
+
+/**
+ * 🌟 核心算法：计算悬浮窗在调整大小时的最终矩形（包含基础约束与边缘智能吸附）
+ * 这是一个纯函数，不依赖任何 Vue 或 DOM 状态。
+ */
+export function calculateSnappedResizeRect(options: SnappedResizeOptions): Rect {
+  const { startRect, boundary, guides, handle, deltaX, deltaY, minSize, enableSnap, snapThreshold } = options;
+
+  // 1. 调用引擎底层的钳制约束，得出绝不越界、绝不小于 minSize 的基础安全矩形
+  const newRect = clampResize({
+    startRect,
+    boundary,
+    offsets: {
+      top: guides.top || 0,
+      bottom: guides.bottom || 0,
+      left: guides.left || 0,
+      right: guides.right || 0,
+    },
+    handle,
+    deltaX,
+    deltaY,
+    minWidth: minSize,
+    minHeight: minSize,
+  });
+
+  // 2. 如果没有开启智能吸附，直接返回基础矩形
+  if (!enableSnap) {
+    return newRect;
+  }
+
+  // 3. 智能边缘磁吸 (Magnetic Snap)
+  // 计算带有安全区(guides)的绝对物理墙壁坐标
+  const wallLeft = boundary.x + (guides.left || 0);
+  const wallRight = boundary.x + boundary.width - (guides.right || 0);
+  const wallTop = boundary.y + (guides.top || 0);
+  const wallBottom = boundary.y + boundary.height - (guides.bottom || 0);
+
+  // --- 横向 X 轴吸附 ---
+  if (handle.includes('e')) {
+    const rightEdge = newRect.x + newRect.width;
+    if (Math.abs(wallRight - rightEdge) <= snapThreshold) {
+      const snappedWidth = wallRight - newRect.x;
+      if (snappedWidth >= minSize) newRect.width = snappedWidth;
+    }
+  } else if (handle.includes('w')) {
+    if (Math.abs(newRect.x - wallLeft) <= snapThreshold) {
+      const snappedWidth = newRect.width + (newRect.x - wallLeft);
+      if (snappedWidth >= minSize) {
+        newRect.width = snappedWidth;
+        newRect.x = wallLeft;
+      }
+    }
+  }
+
+  // --- 纵向 Y 轴吸附 ---
+  if (handle.includes('s')) {
+    const bottomEdge = newRect.y + newRect.height;
+    if (Math.abs(wallBottom - bottomEdge) <= snapThreshold) {
+      const snappedHeight = wallBottom - newRect.y;
+      if (snappedHeight >= minSize) newRect.height = snappedHeight;
+    }
+  } else if (handle.includes('n')) {
+    if (Math.abs(newRect.y - wallTop) <= snapThreshold) {
+      const snappedHeight = newRect.height + (newRect.y - wallTop);
+      if (snappedHeight >= minSize) {
+        newRect.height = snappedHeight;
+        newRect.y = wallTop;
+      }
+    }
+  }
+
+  return newRect;
+}
+
+============================================================
+文件: src/plugins/float-resize/index.ts
+============================================================
+// src/plugins/float-resize/index.ts
+import { markRaw, reactive } from 'vue';
+import type { IaiPlugin } from '../types';
+import type { IaiEngine } from '../../core/IaiEngine';
+import FloatResizeOverlay from './vue/FloatResizeOverlay.vue';
+import { type FloatResizeConfig, DEFAULT_FLOAT_RESIZE_CONFIG } from './config';
+import { floatMoveDrag } from './operators/floatMoveDrag';
+
+export class FloatResizePlugin implements IaiPlugin {
+  public name = 'FloatResizePlugin';
+  public overlayComponent = markRaw(FloatResizeOverlay);
+  public config: FloatResizeConfig;
+
+  constructor(config?: Partial<FloatResizeConfig>) {
+    this.config = reactive({ ...DEFAULT_FLOAT_RESIZE_CONFIG, ...config });
+  }
+
+  install(engine: IaiEngine) {
+    const opPlugin = engine.getPlugins().find((p: any) => p.name === 'OperatorPlugin') as any;
+    if (opPlugin) {
+      opPlugin.register(floatMoveDrag); // 👈 注册
+    }
+  }
+
+  uninstall(engine: IaiEngine) {
+    const opPlugin = engine.getPlugins().find((p: any) => p.name === 'OperatorPlugin') as any;
+    if (opPlugin) {
+      if (typeof opPlugin.unregister === 'function') {
+        opPlugin.unregister('float.move.drag'); // 👈 注销
+      } else {
+        opPlugin.operators?.delete('float.move.drag');
+      }
+    }
+  }
+}
+
+============================================================
+文件: src/plugins/float-resize/operators/floatMoveDrag.ts
+============================================================
+// src/plugins/float-resize/operators/floatMoveDrag.ts
+import type { Operator } from '../../operator/types';
+import { resolveConstraint } from '../../../core/constraint';
+import type { FloatResizePlugin } from '../index';
+
+export const floatMoveDrag: Operator = {
+  id: 'float.move.drag',
+  execute({ engine, props }) {
+    const { sourceId, initialX, initialY } = props;
+
+    const opPlugin = engine.getPlugins().find((p: any) => p.name === 'OperatorPlugin') as any;
+    const plugin = engine.getPlugins().find((p: any) => p.name === 'FloatResizePlugin') as FloatResizePlugin | undefined;
+
+    if (!opPlugin || !plugin) return;
+
+    const fp = engine.getFree(sourceId);
+    if (!fp) return;
+
+    // 🌟 1. 交互规范：拖拽移动时自动置顶并聚焦
+    engine.focus(sourceId);
+    const allFree = engine.getAllFree();
+    const maxZ = allFree.reduce((max, f) => Math.max(max, f.zIndex), 0);
+    engine.updateFree(sourceId, { zIndex: maxZ + 1 });
+
+    // 🌟 2. 提取初始状态和物理配置
+    const startX = fp.x;
+    const startY = fp.y;
+    const width = fp.width;
+    const height = fp.height;
+    // 提取安全区参考线（如果没有则为 0）
+    const guides = fp.panel?.meta?.guides || { top: 0, bottom: 0, left: 0, right: 0 };
+    const config = plugin.config;
+
+    // 🌟 3. 启动通用拖拽引擎事件流
+    opPlugin.exec('drag.start', {
+      sourceId,
+      initialX,
+      initialY,
+      threshold: 5, // 移动面板容错率可以稍微大一点（5px）
+    });
+
+    const onMove = (data: any) => {
+      if (data.sourceId !== sourceId) return;
+
+      const vp = engine.getViewport();
+      const boundary = { x: 0, y: 0, width: vp.width || window.innerWidth, height: vp.height || window.innerHeight };
+
+      // A. 计算基础相对位移
+      let targetX = startX + data.deltaX;
+      let targetY = startY + data.deltaY;
+
+      // B. 基础物理约束：调用引擎原生的“平移求解器”
+      // 这保证了无论你怎么甩鼠标，面板绝不会飞出屏幕和 guides 安全区之外
+      const clamped = resolveConstraint({
+        rect: { x: targetX, y: targetY, width, height },
+        boundary,
+        offsets: guides
+      });
+
+      targetX = clamped.x;
+      targetY = clamped.y;
+
+      // C. 高阶特性：智能磁吸 (Magnetic Snap)
+      // 复用当前插件的 enableSnap 和 snapThreshold 配置
+      if (config.enableSnap) {
+        const threshold = config.snapThreshold || 8;
+        
+        // 计算真实物理墙壁坐标（容器边界 + 安全区偏移）
+        const wallLeft = boundary.x + (guides.left || 0);
+        const wallRight = boundary.x + boundary.width - (guides.right || 0);
+        const wallTop = boundary.y + (guides.top || 0);
+        const wallBottom = boundary.y + boundary.height - (guides.bottom || 0);
+
+        // X 轴磁吸：优先判定是否靠近左墙，再判定是否靠近右墙
+        if (Math.abs(targetX - wallLeft) <= threshold) {
+          targetX = wallLeft;
+        } else if (Math.abs(targetX + width - wallRight) <= threshold) {
+          targetX = wallRight - width;
+        }
+
+        // Y 轴磁吸：优先判定是否靠近顶墙，再判定是否靠近底墙
+        if (Math.abs(targetY - wallTop) <= threshold) {
+          targetY = wallTop;
+        } else if (Math.abs(targetY + height - wallBottom) <= threshold) {
+          targetY = wallBottom - height;
+        }
+      }
+
+      // D. 提交位置更新
+      engine.updateFree(sourceId, { x: targetX, y: targetY });
+    };
+
+    const onEnd = () => {
+      // 拖拽结束时，调用一次底层的 float.clamp 兜个底
+      opPlugin.exec('float.clamp', { target: sourceId });
+      engine.events.off('drag:move', onMove);
+      engine.events.off('drag:end', onEnd);
+    };
+
+    // 挂载监听
+    engine.events.on('drag:move', onMove);
+    engine.events.on('drag:end', onEnd);
+  }
+};
+
+============================================================
+文件: src/plugins/float-resize/vue/FloatResizeOverlay.vue
+============================================================
+<template>
+  <div class="float-resize-overlay">
+    <template v-for="fp in freePanels" :key="fp.id">
+      <template v-if="isResizable(fp.panel)">
+        
+        <div
+          v-if="config.cornerOnly"
+          class="resize-handle corner-only"
+          :style="getCornerStyle(fp)"
+          @pointerdown.prevent.stop="startResize(fp, 'se', $event)"
+        >
+          <div class="corner-visual"></div>
+        </div>
+
+        <template v-else>
+          <div
+            v-for="handle in getHandles(fp)"
+            :key="`${fp.id}-${handle.dir}`"
+            class="resize-handle"
+            :class="`handle-${handle.dir}`"
+            :style="handle.style"
+            @pointerdown.prevent.stop="startResize(fp, handle.dir, $event)"
+          />
+        </template>
+
+      </template>
+    </template>
+  </div>
+</template>
+
+<script setup lang="ts">
+import { ref, onMounted, onUnmounted } from 'vue';
+import { useEngine } from '../../../renderers/vue/composables/useIai';
+import { calculateSnappedResizeRect, type ResizeDirection } from '../core';
+import type { FloatResizePlugin } from '../index';
+
+const engine = useEngine();
+const plugin = engine.getPlugins().find(p => p.name === 'FloatResizePlugin') as FloatResizePlugin;
+
+// 🌟 极简读取：因为 plugin.config 已经是 reactive，直接引用即可！
+const config = plugin.config;
+
+// 同步悬浮窗列表
+const freePanels = ref<any[]>([]);
+const updateFreePanels = () => {
+  freePanels.value = engine.getAllFree();
+};
+
+onMounted(() => {
+  engine.events.on('free:update', updateFreePanels);
+  updateFreePanels();
+});
+
+onUnmounted(() => {
+  engine.events.off('free:update', updateFreePanels);
+});
+
+const isResizable = (panel: any) => {
+  const props = engine.getPanelProps(panel);
+  return props.resizable !== false;
+};
+
+// 计算八向物理把手定位
+const getHandles = (fp: any) => {
+  const s = config.handleSize;
+  const h = s / 2;
+  const c = s * 2;
+  const ch = c / 2;
+
+  const baseStyle = { position: 'absolute' as const, boxSizing: 'border-box' as const };
+
+  return [
+    { dir: 'n' as ResizeDirection, style: { ...baseStyle, left: `${fp.x}px`, top: `${fp.y - h}px`, width: `${fp.width}px`, height: `${s}px`, cursor: 'ns-resize' } },
+    { dir: 's' as ResizeDirection, style: { ...baseStyle, left: `${fp.x}px`, top: `${fp.y + fp.height - h}px`, width: `${fp.width}px`, height: `${s}px`, cursor: 'ns-resize' } },
+    { dir: 'e' as ResizeDirection, style: { ...baseStyle, left: `${fp.x + fp.width - h}px`, top: `${fp.y}px`, width: `${s}px`, height: `${fp.height}px`, cursor: 'ew-resize' } },
+    { dir: 'w' as ResizeDirection, style: { ...baseStyle, left: `${fp.x - h}px`, top: `${fp.y}px`, width: `${s}px`, height: `${fp.height}px`, cursor: 'ew-resize' } },
+    { dir: 'nw' as ResizeDirection, style: { ...baseStyle, left: `${fp.x - ch}px`, top: `${fp.y - ch}px`, width: `${c}px`, height: `${c}px`, cursor: 'nwse-resize' } },
+    { dir: 'ne' as ResizeDirection, style: { ...baseStyle, left: `${fp.x + fp.width - ch}px`, top: `${fp.y - ch}px`, width: `${c}px`, height: `${c}px`, cursor: 'nesw-resize' } },
+    { dir: 'sw' as ResizeDirection, style: { ...baseStyle, left: `${fp.x - ch}px`, top: `${fp.y + fp.height - ch}px`, width: `${c}px`, height: `${c}px`, cursor: 'nesw-resize' } },
+    { dir: 'se' as ResizeDirection, style: { ...baseStyle, left: `${fp.x + fp.width - ch}px`, top: `${fp.y + fp.height - ch}px`, width: `${c}px`, height: `${c}px`, cursor: 'nwse-resize' } },
+  ];
+};
+
+// 计算右下角模式的物理定位
+const getCornerStyle = (fp: any) => {
+  const s = config.handleSize * 2;
+  return {
+    position: 'absolute' as const,
+    left: `${fp.x + fp.width - s}px`,
+    top: `${fp.y + fp.height - s}px`,
+    width: `${s}px`,
+    height: `${s}px`,
+    cursor: 'nwse-resize'
+  };
+};
+
+const startResize = (fp: any, direction: ResizeDirection, e: PointerEvent) => {
+  engine.focus(fp.id);
+  const allFree = engine.getAllFree();
+  const maxZ = allFree.reduce((max, f) => Math.max(max, f.zIndex), 0);
+  engine.updateFree(fp.id, { zIndex: maxZ + 1 });
+
+  const startRect = { x: fp.x, y: fp.y, width: fp.width, height: fp.height };
+  const guides = fp.panel?.meta?.guides || {};
+  const realProps = engine.getPanelProps(fp.panel);
+  const panelMinSize = realProps.minSize ?? 40; 
+  
+  const opPlugin = engine.getPlugins().find(p => p.name === 'OperatorPlugin') as any;
+  opPlugin?.exec('drag.start', { sourceId: fp.id, initialX: e.clientX, initialY: e.clientY, threshold: 2 });
+  
+  const onMove = (data: any) => {
+    if (data.sourceId !== fp.id) return;
+
+    const vp = engine.getViewport();
+    const boundary = { x: 0, y: 0, width: vp.width || window.innerWidth, height: vp.height || window.innerHeight };
+    
+    const newRect = calculateSnappedResizeRect({
+      startRect,
+      boundary,
+      guides,
+      handle: direction,
+      deltaX: data.deltaX,
+      deltaY: data.deltaY,
+      minSize: panelMinSize,
+      enableSnap: config.enableSnap,
+      snapThreshold: config.snapThreshold
+    });
+    
+    engine.updateFree(fp.id, newRect);
+  };
+
+  const onEnd = () => {
+    engine.events.off('drag:move', onMove);
+    engine.events.off('drag:end', onEnd);
+  };
+
+  engine.events.on('drag:move', onMove);
+  engine.events.on('drag:end', onEnd);
+};
+</script>
+
+<style scoped>
+.float-resize-overlay {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 10002;
+}
+
+/* 保证所有把手的物理层能够响应鼠标事件 */
+.resize-handle {
+  pointer-events: auto;
+  transition: background-color 0.15s ease-out;
+  background-color: transparent;
+}
+
+/* 默认八向把手的视觉悬停效果 (可在全局 CSS 覆盖) */
+.resize-handle:hover {
+  background-color: rgba(0, 122, 204, 0.4);
+}
+
+/* 🌟 cornerOnly 小三角视觉层：绝对保证渲染出来！ */
+.resize-handle.corner-only .corner-visual {
+  position: absolute;
+  right: 2px;
+  bottom: 2px;
+  width: 0;
+  height: 0;
+  border-left: 12px solid transparent;
+  border-bottom: 12px solid rgba(150, 150, 150, 0.6);
+  transition: border-bottom-color 0.15s ease-out;
+}
+
+.resize-handle.corner-only:hover .corner-visual {
+  border-bottom-color: rgba(0, 122, 204, 0.9);
+}
+</style>
+
+============================================================
+文件: src/plugins/index.ts
+============================================================
+// src/plugins/index.ts
+export { OperatorPlugin } from './operator';
+export { DominoPlugin } from './domino';
+export { DockingPlugin } from './docking';
+export { InteractiveSplitPlugin } from './interactive-split';
+export { FloatResizePlugin } from './float-resize';
+
+============================================================
+文件: src/plugins/interactive-split/index.ts
+============================================================
+// src/plugins/interactive-split/index.ts
+import { markRaw } from 'vue';
+import type { IaiPlugin } from '../../plugins/types';
+import InteractiveSplitOverlay from './vue/InteractiveSplitOverlay.vue';
+import { interactiveSplitStart, interactiveSplitCancel } from './operators/interactiveSplit';
+
+export interface InteractiveSplitConfig {
+  lineWidth: number;
+  lineColor: string;
+  snapToCenter: boolean;
+  snapThreshold: number;
+  snapColor: string;
+  cursor: string;
+}
+
+const DEFAULT_CONFIG: InteractiveSplitConfig = {
+  lineWidth: 2,
+  lineColor: '#007fd4',
+  snapToCenter: true,
+  snapThreshold: 15,
+  snapColor: '#00ff88',
+  cursor: 'crosshair',
+};
+
+export class InteractiveSplitPlugin implements IaiPlugin {
+  public name = 'InteractiveSplitPlugin';
+  public overlayComponent = markRaw(InteractiveSplitOverlay);
+  public config: InteractiveSplitConfig;
+  private engine: any = null;
+
+  constructor(config?: Partial<InteractiveSplitConfig>) {
+    this.config = { ...DEFAULT_CONFIG, ...config };
+  }
+
+  install(engine: any) {
+    this.engine = engine;
+    const opPlugin = engine.getPlugins().find((p: any) => p.name === 'OperatorPlugin');
+    
+    if (opPlugin) {
+      // 注册操作符
+      opPlugin.register(interactiveSplitStart);
+      opPlugin.register(interactiveSplitCancel);
+    } else {
+      console.warn('InteractiveSplitPlugin 必须在 OperatorPlugin 之后挂载');
+    }
+  }
+
+  // 🌟 新增：严谨的卸载逻辑
+  uninstall(engine: any) {
+    const opPlugin = engine.getPlugins().find((p: any) => p.name === 'OperatorPlugin');
+    
+    if (opPlugin) {
+      // 1. 强制终止可能正在进行的切割交互，清理内存和 DOM 事件
+      opPlugin.exec('interactive.split.cancel');
+      
+      // 2. 从操作符中心注销（假设你的 OperatorPlugin 提供了 unregister，如果没有，可以操作内部 Map）
+      if (typeof opPlugin.unregister === 'function') {
+        opPlugin.unregister('interactive.split.start');
+        opPlugin.unregister('interactive.split.cancel');
+      } else {
+        // 如果没有提供 unregister，手动清理
+        opPlugin.operators?.delete('interactive.split.start');
+        opPlugin.operators?.delete('interactive.split.cancel');
+      }
+    }
+    this.engine = null;
+  }
+}
+
+============================================================
+文件: src/plugins/interactive-split/operators/interactiveSplit.ts
+============================================================
+// src/plugins/interactive-split/operators/interactiveSplit.ts
+import type { Operator } from '../../operator/types';
+import { splitState } from '../state';
+import type { GeometryMap, Rect } from '../../../core/types';
+import type { InteractiveSplitPlugin } from '../index';
+
+let cleanupFn: (() => void) | null = null;
+
+export const interactiveSplitStart: Operator = {
+  id: 'interactive.split.start',
+  execute({ engine, props }) {
+    if (splitState.isActive) return;
+
+    // 🌟 支持高度配置：取消按键、取消鼠标键（默认右键2，传 null 禁用）
+    const { 
+      mode = 'horizontal', 
+      newPanelType, 
+      sourceId, 
+      cancelKey = 'Escape', 
+      cancelButton = 2 
+    } = props;
+    
+    if (!sourceId) {
+      console.warn('[IaiEngine] interactive.split.start 必须传入 sourceId');
+      return;
+    }
+
+    splitState.isActive = true;
+    splitState.mode = mode as 'horizontal' | 'vertical';
+    splitState.direction = splitState.mode;
+    splitState.newPanelType = newPanelType;
+    splitState.sourceId = sourceId;
+
+    const plugin = engine.getPlugins().find((p: any) => p.name === 'InteractiveSplitPlugin') as InteractiveSplitPlugin;
+    const config = plugin?.config;
+    if (!config) return;
+
+    const vp = engine.getViewport();
+
+    const onMove = (e: PointerEvent) => {
+      const { x, y } = getContainerOffset(e);
+      const geoMap = engine.getGeoMap(vp.width || window.innerWidth, vp.height || window.innerHeight);
+      
+      // 🌟 直接拿唯一目标面板的矩形，不再循环找别人！
+      const targetRect = getTargetRect(engine, geoMap, splitState.sourceId!);
+
+      // 如果目标面板不存在，或者鼠标超出了它的范围，立刻隐藏线条
+      if (!targetRect || x < targetRect.x || x > targetRect.x + targetRect.width || y < targetRect.y || y > targetRect.y + targetRect.height) {
+        splitState.isHovering = false;
+        return;
+      }
+
+      splitState.isHovering = true;
+      const dir = splitState.mode;
+
+      let exactX = x;
+      let exactY = y;
+      let isSnapped = false;
+
+      // 中点吸附
+      if (config.snapToCenter) {
+        const centerX = targetRect.x + targetRect.width / 2;
+        const centerY = targetRect.y + targetRect.height / 2;
+        
+        if (dir === 'horizontal' && Math.abs(x - centerX) < config.snapThreshold) {
+          exactX = centerX;
+          isSnapped = true;
+        }
+        if (dir === 'vertical' && Math.abs(y - centerY) < config.snapThreshold) {
+          exactY = centerY;
+          isSnapped = true;
+        }
+      }
+
+      splitState.isSnapped = isSnapped;
+
+      if (dir === 'horizontal') {
+        splitState.x = exactX;
+        splitState.y = targetRect.y;
+        splitState.length = targetRect.height;
+      } else {
+        splitState.x = targetRect.x;
+        splitState.y = exactY;
+        splitState.length = targetRect.width;
+      }
+    };
+
+    const onPointerDown = (e: PointerEvent) => {
+      // 🌟 1. 匹配自定义的取消鼠标键 (比如右键 e.button === 2)
+      if (cancelButton !== null && e.button === cancelButton) {
+        cancel();
+        return;
+      }
+
+      // 🌟 2. 只有左键 (0) 才能进行切割
+      if (e.button !== 0) return;
+
+      // 🌟 3. 如果点击时鼠标不在源面板内部，直接视作取消操作
+      if (!splitState.isHovering) {
+        cancel();
+        return;
+      }
+
+      const opPlugin = engine.getPlugins().find((p: any) => p.name === 'OperatorPlugin') as any;
+      if (opPlugin) {
+        const geoMap = engine.getGeoMap(vp.width || window.innerWidth, vp.height || window.innerHeight);
+        const targetRect = getTargetRect(engine, geoMap, splitState.sourceId!);
+
+        if (targetRect) {
+          const offsetPixels = splitState.direction === 'horizontal' 
+            ? splitState.x - targetRect.x 
+            : splitState.y - targetRect.y;
+
+          opPlugin.exec('panel.split', {
+            targetId: splitState.sourceId,
+            direction: splitState.direction,
+            pixels: offsetPixels,
+            panelType: splitState.newPanelType,
+            insertAsSecond: true
+          });
+        }
+      }
+      cancel();
+    };
+
+    const onKeydown = (e: KeyboardEvent) => {
+      // 🌟 匹配自定义的取消键盘按键
+      if (cancelKey && e.key === cancelKey) {
+        cancel();
+      }
+    };
+
+    const onContextMenu = (e: MouseEvent) => {
+      // 如果是用右键取消，必须阻止系统默认的右键菜单弹出
+      if (cancelButton === 2) {
+        e.preventDefault();
+      }
+    };
+
+    const cancel = () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerdown', onPointerDown);
+      window.removeEventListener('keydown', onKeydown);
+      window.removeEventListener('contextmenu', onContextMenu);
+      splitState.isActive = false;
+      splitState.isHovering = false;
+      cleanupFn = null;
+    };
+
+    cleanupFn = cancel;
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerdown', onPointerDown);
+    window.addEventListener('keydown', onKeydown);
+    window.addEventListener('contextmenu', onContextMenu);
+  }
+};
+
+export const interactiveSplitCancel: Operator = {
+  id: 'interactive.split.cancel',
+  execute() {
+    if (cleanupFn) cleanupFn();
+  }
+};
+
+// ── 辅助函数 ──
+function getContainerOffset(e: PointerEvent) {
+  const el = document.querySelector('.iai-layout-container') as HTMLElement;
+  if (!el) return { x: e.clientX, y: e.clientY };
+  const rect = el.getBoundingClientRect();
+  return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+}
+
+function getTargetRect(engine: any, geoMap: GeometryMap, id: string): Rect | null {
+  const fp = engine.getFree(id);
+  if (fp) return { x: fp.x, y: fp.y, width: fp.width, height: fp.height };
+  return geoMap.get(id) || null;
+}
+
+============================================================
+文件: src/plugins/interactive-split/state.ts
+============================================================
+// src/plugins/interactive-split/state.ts
+import { reactive } from 'vue';
+
+export const splitState = reactive({
+  isActive: false,
+  isHovering: false, // 鼠标是否在锁定的面板内？
+  mode: 'horizontal' as 'horizontal' | 'vertical', 
+  sourceId: null as string | null, // 🌟 唯一被锁死的面板 ID
+  direction: 'horizontal' as 'horizontal' | 'vertical',
+  x: 0,
+  y: 0,
+  length: 0,
+  isSnapped: false,
+  newPanelType: undefined as string | undefined, 
+});
+
+============================================================
+文件: src/plugins/interactive-split/vue/InteractiveSplitOverlay.vue
+============================================================
+<template>
+  <div 
+    class="interactive-split-overlay" 
+    v-show="splitState.isActive"
+    :style="{ cursor: config.cursor }"
+  >
+    <div class="split-capture-layer"></div>
+
+    <div 
+      v-if="splitState.isHovering"
+      class="split-preview-line"
+      :style="lineStyle"
+    ></div>
+  </div>
+</template>
+
+<script setup lang="ts">
+import { computed } from 'vue';
+import { useEngine } from '../../../renderers/vue/composables/useIai';
+import { splitState } from '../state';
+import type { InteractiveSplitPlugin } from '../index';
+
+const engine = useEngine();
+
+const config = computed(() => {
+  const plugin = engine.getPlugins().find(p => p.name === 'InteractiveSplitPlugin') as InteractiveSplitPlugin;
+  return plugin?.config || ({} as any);
+});
+
+const lineStyle = computed(() => {
+  const c = config.value;
+  const baseStyle = {
+    backgroundColor: splitState.isSnapped ? c.snapColor : c.lineColor,
+    boxShadow: `0 0 6px ${splitState.isSnapped ? c.snapColor : c.lineColor}`,
+  };
+
+  if (splitState.direction === 'horizontal') {
+    return {
+      ...baseStyle,
+      left: `${splitState.x - c.lineWidth / 2}px`,
+      top: `${splitState.y}px`,
+      width: `${c.lineWidth}px`,
+      height: `${splitState.length}px`,
+    };
+  } else {
+    return {
+      ...baseStyle,
+      left: `${splitState.x}px`,
+      top: `${splitState.y - c.lineWidth / 2}px`,
+      width: `${splitState.length}px`,
+      height: `${c.lineWidth}px`,
+    };
+  }
+});
+</script>
+
+<style scoped>
+.interactive-split-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 15000;
+}
+.split-capture-layer {
+  width: 100%;
+  height: 100%;
+  background: transparent;
+}
+.split-preview-line {
+  position: absolute;
+  pointer-events: none;
+  transition: background-color 0.1s, box-shadow 0.1s;
+  border-radius: 2px;
+}
+</style>
+
+============================================================
+文件: src/plugins/operator/index.ts
+============================================================
+import type { IaiPlugin } from '../types';
+import type { IaiEngine } from '../../core/IaiEngine';
+import type { Operator } from './types';
+import { panelSplit } from './operators/panelSplit';
+import { panelHide } from './operators/panelHide';
+import { panelSwitch } from './operators/panelSwitch';
+import { panelFloat } from './operators/panelFloat';
+import { stashRestore } from './operators/stashRestore';
+import { stashPurge } from './operators/stashPurge';
+import { panelDestroy } from './operators/panelDestroy';
+import { dragStart } from './operators/dragStart';
+import { floatMove } from './operators/floatMove';
+import { floatResize } from './operators/floatResize';
+import { floatClamp } from './operators/floatClamp';
+import { floatGetLayer } from './operators/floatGetLayer';
+import { floatSetLayer } from './operators/floatSetLayer';
+import { floatSetBounds } from './operators/floatSetBounds';
+import { splitLineGet } from './operators/splitLineGet';
+import { splitLineSetProps } from './operators/splitLineSetProps';
+import { floatFocus } from './operators/floatFocus';
+
+export class OperatorPlugin implements IaiPlugin {
+  public name = 'OperatorPlugin';
+  private engine!: IaiEngine;
+  private operators = new Map<string, Operator>();
+
+  constructor() {
+    // 注册所有内置操作符
+    this.register(panelSplit);
+    this.register(panelHide);
+    this.register(panelSwitch);
+    this.register(panelFloat);
+    this.register(stashRestore);
+    this.register(stashPurge);
+    this.register(panelDestroy);
+    this.register(dragStart);
+    this.register(floatMove);
+    this.register(floatResize);
+    this.register(floatClamp);
+    this.register(floatGetLayer);
+    this.register(floatSetLayer);
+    this.register(floatSetBounds);
+    this.register(splitLineGet);
+    this.register(splitLineSetProps);
+    this.register(floatFocus);
+  }
+
+  install(engine: IaiEngine) { this.engine = engine; }
+  uninstall() { this.operators.clear(); }
+
+  /** 注册新操作符（开发者扩展入口） */
+  register(op: Operator) {
+    this.operators.set(op.id, op);
+  }
+
+  /** 执行操作符 */
+  exec(id: string, props: Record<string, any> = {}) {
+    const op = this.operators.get(id);
+    if (!op) {
+      console.warn(`[OperatorPlugin] 未知操作符: ${id}`);
+      return undefined;
+    }
+    return op.execute({ engine: this.engine, props });
+  }
+}
+
+============================================================
+文件: src/plugins/operator/operators/dragStart.ts
+============================================================
+import type { Operator } from '../types';
+
+export const dragStart: Operator = {
+  id: 'drag.start',
+  execute({ engine, props }) {
+    const {
+      sourceId,
+      initialX,
+      initialY,
+      threshold = 5,
+      detectHover = false,
+    } = props;
+
+    if (typeof initialX !== 'number' || typeof initialY !== 'number') return;
+
+    const sourceEntity = engine.getAny(sourceId);
+    if (!sourceEntity) return;
+    const sourceType = engine.getFree(sourceId) ? 'float' : 'grid';
+
+    let startX = initialX;
+    let startY = initialY;
+    let isDragging = false;
+    let hasMoved = false;
+    let rafId: number | null = null;
+    let hoveredPanelId: string | null = null;
+
+    // ── DOM 护盾 ──
+    let shield: HTMLDivElement | null = null;
+
+    const onPointerMove = (e: PointerEvent) => {
+      if (!hasMoved) {
+        const dx = Math.abs(e.clientX - startX);
+        const dy = Math.abs(e.clientY - startY);
+        if (dx < threshold && dy < threshold) return;
+        hasMoved = true;
+        isDragging = true;
+
+        // 创建全屏透明护盾，拦截所有鼠标事件
+        shield = document.createElement('div');
+        shield.style.cssText = 'position:fixed;inset:0;z-index:99999;cursor:inherit;';
+        document.body.appendChild(shield);
+        document.body.style.userSelect = 'none';
+        document.body.style.cursor = sourceType === 'float' ? 'move' : 'grabbing';
+
+        engine.events.emit('drag:start', { sourceId, sourceType });
+      }
+
+      if (!isDragging) return;
+
+      if (!rafId) {
+        rafId = requestAnimationFrame(() => {
+          let panelId: string | null = null;
+
+          if (detectHover) {
+            // 临时隐藏护盾，检测下方元素，再恢复
+            if (shield) shield.style.display = 'none';
+            const elemBelow = document.elementFromPoint(e.clientX, e.clientY);
+            panelId = elemBelow?.closest?.('[data-node-id]')?.getAttribute?.('data-node-id') || null;
+            if (shield) shield.style.display = '';
+          }
+
+          if (panelId !== hoveredPanelId) {
+            hoveredPanelId = panelId;
+          }
+
+          engine.events.emit('drag:move', {
+            sourceId,
+            sourceType,
+            x: e.clientX,
+            y: e.clientY,
+            deltaX: e.clientX - startX,
+            deltaY: e.clientY - startY,
+            hoveredPanelId,
+          });
+
+          rafId = null;
+        });
+      }
+    };
+
+    // 🌟 修复：添加事件参数 e
+    const onPointerUp = (e: PointerEvent) => {
+      if (rafId) {
+        cancelAnimationFrame(rafId);
+        rafId = null;
+      }
+
+      // 移除护盾
+      if (shield) {
+        shield.remove();
+        shield = null;
+      }
+      document.body.style.userSelect = '';
+      document.body.style.cursor = '';
+
+      if (isDragging) {
+        let finalPanelId: string | null = null;
+        if (detectHover) {
+          const elemBelow = document.elementFromPoint(e.clientX, e.clientY);
+          finalPanelId = elemBelow?.closest?.('[data-node-id]')?.getAttribute?.('data-node-id') || null;
+        }
+
+        engine.events.emit('drag:end', {
+          sourceId,
+          sourceType,
+          endX: e.clientX,
+          endY: e.clientY,
+          deltaX: e.clientX - startX,
+          deltaY: e.clientY - startY,
+          hoveredPanelId: finalPanelId,
+        });
+      }
+
+      window.removeEventListener('pointermove', onPointerMove);
+      window.removeEventListener('pointerup', onPointerUp);
+    };
+
+    window.addEventListener('pointermove', onPointerMove);
+    window.addEventListener('pointerup', onPointerUp);
+  },
+};
+
+============================================================
+文件: src/plugins/operator/operators/floatClamp.ts
+============================================================
+// src/plugins/operator/operators/floatClamp.ts
+import type { Operator } from '../types';
+import { resolveConstraint } from '../../../core/constraint';
+
+export const floatClamp: Operator = {
+  id: 'float.clamp',
+  execute({ engine, props }) {
+    const { target } = props;
+    const viewport = engine.getViewport();
+    const boundary = {
+      x: 0,
+      y: 0,
+      width: viewport.width || window.innerWidth,
+      height: viewport.height || window.innerHeight,
+    };
+
+    const clampPanel = (id: string) => {
+      const fp = engine.getFree(id);
+      if (!fp) return;
+
+      const metaGuides = fp.panel?.meta?.guides;
+      const guides = props.offsets || metaGuides || { top: 0, bottom: 0, left: 0, right: 0 };
+      const offsets = {
+        top: guides.top ?? 0,
+        bottom: guides.bottom ?? 0,
+        left: guides.left ?? 0,
+        right: guides.right ?? 0,
+      };
+
+      const result = resolveConstraint({
+        rect: { x: fp.x, y: fp.y, width: fp.width, height: fp.height },
+        boundary,
+        offsets,
+      });
+
+      engine.updateFree(id, { x: result.x, y: result.y });
+    };
+
+    if (target) {
+      clampPanel(target);
+    } else {
+      for (const fp of engine.getAllFree()) {
+        clampPanel(fp.id);
+      }
+    }
+  },
+};
+
+============================================================
+文件: src/plugins/operator/operators/floatFocus.ts
+============================================================
+import type { Operator } from '../types';
+
+export const floatFocus: Operator = {
+  id: 'float.focus',
+  execute({ engine, props }) {
+    const { id } = props;
+    if (!id) return;
+    const fp = engine.getFree(id);
+    if (!fp) return;
+
+    // 置顶：设为最大 zIndex + 1
+    const allFree = engine.getAllFree();
+    const maxZ = allFree.reduce((max, f) => Math.max(max, f.zIndex), 0);
+    engine.updateFree(id, { zIndex: maxZ + 1 });
+    engine.focus(id);
+  },
+};
+
+============================================================
+文件: src/plugins/operator/operators/floatGetLayer.ts
+============================================================
+import type { Operator } from '../types';
+
+export const floatGetLayer: Operator = {
+  id: 'float.getLayer',
+  execute({ engine, props }) {
+    const { id, mode = 'max' } = props;  // mode: 'max' | 'min' | 'single'
+
+    if (mode === 'single') {
+      if (!id) return null;
+      const fp = engine.getFree(id);
+      return fp?.zIndex ?? null;
+    }
+
+    const allFree = engine.getAllFree();
+    if (allFree.length === 0) return mode === 'max' ? 0 : 9999;
+
+    const zValues = allFree.map(f => f.zIndex);
+    return mode === 'max' ? Math.max(...zValues) : Math.min(...zValues);
+  },
+};
+
+============================================================
+文件: src/plugins/operator/operators/floatMove.ts
+============================================================
+// src/plugins/operator/operators/floatMove.ts
+import type { Operator } from '../types';
+
+export const floatMove: Operator = {
+  id: 'float.move',
+  execute({ engine, props }) {
+    const { id, x, y } = props;
+    if (typeof x !== 'number' || typeof y !== 'number') return;
+
+    const fp = engine.getFree(id);
+    if (!fp) return;
+
+    engine.updateFree(id, { x, y });
+  },
+};
+
+============================================================
+文件: src/plugins/operator/operators/floatResize.ts
+============================================================
+// src/plugins/operator/operators/floatResize.ts
+import type { Operator } from '../types';
+
+export const floatResize: Operator = {
+  id: 'float.resize',
+  execute({ engine, props }) {
+    const { id, width, height } = props;
+    if (typeof width !== 'number' || typeof height !== 'number') return;
+
+    const fp = engine.getFree(id);
+    if (!fp) return;
+
+    engine.updateFree(id, { width, height });
+  },
+};
+
+============================================================
+文件: src/plugins/operator/operators/floatSetBounds.ts
+============================================================
+import type { Operator } from '../types';
+
+export const floatSetBounds: Operator = {
+  id: 'float.setBounds',
+  execute({ engine, props }) {
+    const { id, offsets } = props;
+    if (!offsets) return;
+
+    const fp = engine.getFree(id);
+    if (!fp) return;
+
+    // 深合并到 meta.guides
+    if (!fp.panel.meta) fp.panel.meta = {};
+    fp.panel.meta.guides = {
+      ...fp.panel.meta.guides,
+      ...offsets,
+    };
+
+    // 触发更新（让可视化层刷新参考线）
+    engine.events.emit('free:update', { count: engine.getAllFree().length });
+  },
+};
+
+============================================================
+文件: src/plugins/operator/operators/floatSetLayer.ts
+============================================================
+import type { Operator } from '../types';
+
+export const floatSetLayer: Operator = {
+  id: 'float.setLayer',
+  execute({ engine, props }) {
+    const { id, zIndex } = props;
+    if (typeof zIndex !== 'number') return;
+
+    const fp = engine.getFree(id);
+    if (!fp) return;
+
+    engine.updateFree(id, { zIndex });
+  },
+};
+
+============================================================
+文件: src/plugins/operator/operators/panelDestroy.ts
+============================================================
+import type { Operator } from '../types';
+
+export const panelDestroy: Operator = {
+  id: 'panel.destroy',
+  execute({ engine, props }) {
+    const { id } = props;
+    engine.deleteAny(id); // 真销毁面板
+  }
+};
+
+============================================================
+文件: src/plugins/operator/operators/panelFloat.ts
+============================================================
+import type { Operator } from '../types';
+
+export const panelFloat: Operator = {
+  id: 'panel.float',
+  execute({ engine, props }) {
+    const {
+      sourceId,
+      x = 200,
+      y = 200,
+      keepSource = true,
+    } = props;
+
+    const entity = engine.getAny(sourceId);
+    if (!entity) return;
+
+    // 创建新本体（数据共享由注册配置和 $shared/$private 决定）
+    const panel = engine.createMaster(entity.panelType);
+    engine.addFree(panel, { x, y, width: 400, height: 300 }, 200);
+
+    // 如果不保留旧面板，则隐藏旧面板
+    if (!keepSource) {
+      engine.stash(sourceId);
+    }
+  },
+};
+
+============================================================
+文件: src/plugins/operator/operators/panelHide.ts
+============================================================
+import type { Operator } from '../types';
+
+export const panelHide: Operator = {
+  id: 'panel.hide',
+  execute({ engine, props }) {
+    const { id } = props;
+    engine.stash(id); // 隐藏面板，放入暂存池
+  }
+};
+
+============================================================
+文件: src/plugins/operator/operators/panelSplit.ts
+============================================================
+import type { Operator } from '../types';
+
+export const panelSplit: Operator = {
+  id: 'panel.split',
+  execute({ engine, props }) {
+    const {
+      targetId,
+      direction,
+      ratio = 0.5,
+      insertAsSecond = true,
+    } = props;
+
+    // 获取目标面板（可能来自网格树或自由池）
+    const freePanel = engine.getFree(targetId);
+    const gridNode = engine.getNode(targetId);
+
+    // ── 分割悬浮窗 ──
+    if (freePanel) {
+      const panel1 = engine.createMaster(freePanel.panel.panelType);
+      const panel2 = engine.createMaster(freePanel.panel.panelType);
+
+      const { x, y, width, height } = freePanel;
+      engine.removeFree(targetId);
+
+      if (direction === 'horizontal') {
+        const w1 = Math.round(width * ratio);
+        engine.addFree(panel1, { x, y, width: w1, height }, 200);
+        engine.addFree(panel2, { x: x + w1, y, width: width - w1, height }, 200);
+      } else {
+        const h1 = Math.round(height * ratio);
+        engine.addFree(panel1, { x, y, width, height: h1 }, 200);
+        engine.addFree(panel2, { x, y: y + h1, width, height: height - h1 }, 200);
+      }
+      return;
+    }
+
+    // ── 分割网格面板 ──
+    if (gridNode) {
+      const newPanel = engine.createMaster(gridNode.panelType);
+      engine.splitNode(targetId, direction, ratio, newPanel, insertAsSecond);
+      return;
+    }
+  },
+};
+
+============================================================
+文件: src/plugins/operator/operators/panelSwitch.ts
+============================================================
+// src/plugins/operator/operators/panelSwitch.ts
+import type { Operator } from '../types';
+
+export const panelSwitch: Operator = {
+  id: 'panel.switch',
+  execute({ engine, props }) {
+    const { targetId, newType, targetPanelId } = props;
+    const oldEntity = engine.getAny(targetId);
+    if (!oldEntity || newType === oldEntity.panelType) return;
+
+    // ── 手动指定模式：恢复指定面板，暂存当前面板 ──
+    if (targetPanelId) {
+      const specified = engine.getAny(targetPanelId) || engine.getStash(targetPanelId);
+      if (!specified) return;
+      
+      // 如果指定面板在暂存池中，先取出
+      if (engine.getStash(targetPanelId)) {
+        engine.removeStash(targetPanelId);
+      }
+      
+      // 执行替换：指定面板上场
+      engine.replace(targetId, specified);
+      
+      // 当前面板暂存（不删除）
+      engine.addToStash(oldEntity);
+      return;
+    }
+
+    // ── 默认模式：原地修改面板类型，不创建新面板，不暂存旧面板 ──
+    const switched = {
+      ...oldEntity,
+      panelType: newType,
+    };
+
+    engine.replace(targetId, switched);
+  },
+};
+
+============================================================
+文件: src/plugins/operator/operators/splitLineGet.ts
+============================================================
+import type { Operator } from '../types';
+
+export const splitLineGet: Operator = {
+  id: 'splitLine.get',
+  execute({ engine, props }) {
+    const { id } = props;
+    const root = engine.getRoot();
+    if (!root) return id ? null : [];
+
+    const collectAllSplits = (node: any): any[] => {
+      if (node.type === 'split') {
+        return [node, ...collectAllSplits(node.children[0]), ...collectAllSplits(node.children[1])];
+      }
+      if (node.children) {
+        return [...collectAllSplits(node.children[0]), ...collectAllSplits(node.children[1])];
+      }
+      return [];
+    };
+
+    // 不传 id → 返回所有分割线列表
+    if (!id) {
+      return collectAllSplits(root).map(s => ({
+        id: s.id,
+        direction: s.direction,
+        ratio: s.ratio,
+        resizable: s.resizable !== false,
+      }));
+    }
+
+    // 传 id → 返回单个分割线属性
+    const findSplit = (node: any): any => {
+      if (node.id === id && node.type === 'split') return node;
+      if (node.children) return findSplit(node.children[0]) || findSplit(node.children[1]);
+      return null;
+    };
+
+    const splitNode = findSplit(root);
+    if (!splitNode) return null;
+
+    return {
+      id: splitNode.id,
+      direction: splitNode.direction,
+      ratio: splitNode.ratio,
+      resizable: splitNode.resizable !== false,
+      children: splitNode.children.map((c: any) => ({ id: c.id, type: c.type })),
+    };
+  },
+};
+
+============================================================
+文件: src/plugins/operator/operators/splitLineSetProps.ts
+============================================================
+import type { Operator } from '../types';
+
+export const splitLineSetProps: Operator = {
+  id: 'splitLine.setProps',
+  execute({ engine, props }) {
+    const { id, resizable, ratio } = props;
+    if (!id) return false;
+
+    const root = engine.getRoot();
+    if (!root) return false;
+
+    // 深度搜索 SplitNode
+    const findSplit = (node: any): any => {
+      if (node.id === id && node.type === 'split') return node;
+      if (node.children) return findSplit(node.children[0]) || findSplit(node.children[1]);
+      return null;
+    };
+
+    const splitNode = findSplit(root);
+    if (!splitNode) return false;
+
+    const updated = { ...splitNode };
+    if (resizable !== undefined) updated.resizable = resizable;
+    if (ratio !== undefined) updated.ratio = Math.max(0, Math.min(1, ratio));
+
+    return engine.replace(id, updated);
+  },
+};
+
+============================================================
+文件: src/plugins/operator/operators/stashPurge.ts
+============================================================
+import type { Operator } from '../types';
+
+export const stashPurge: Operator = {
+  id: 'stash.purge',
+  execute({ engine, props }) {
+    const { panelType } = props;
+    const list = panelType
+      ? engine.getAllStash().filter((s: any) => s.panelType === panelType)
+      : engine.getAllStash();
+    for (const entity of list) {
+      engine.removeStash(entity.instanceId || entity.id);
+    }
+  }
+};
+
+============================================================
+文件: src/plugins/operator/operators/stashRestore.ts
+============================================================
+import type { Operator } from '../types';
+
+export const stashRestore: Operator = {
+  id: 'stash.restore',
+  execute({ engine, props }) {
+    const { instanceId, x = 200, y = 200 } = props;
+    const entity = engine.getStash(instanceId);
+    if (!entity) return;
+    engine.removeStash(instanceId);
+    engine.addFree(entity, { x, y, width: 400, height: 300 }, 200);
+  }
+};
+
+============================================================
+文件: src/plugins/operator/types.ts
+============================================================
+import type { IaiEngine } from '../../core/IaiEngine';
+
+export interface OperatorPropsSchemaItem {
+  type: 'string' | 'number' | 'select' | 'boolean';
+  label: string;
+  default?: any;
+  options?: string[];      // type=select 时的选项
+  required?: boolean;
+  description?: string;    // 帮助文本
+}
+
+export interface Operator {
+  id: string;
+  execute: (ctx: OperatorContext) => any; // 允许返回值
+  description?: string;
+  propsSchema?: Record<string, OperatorPropsSchemaItem>;
+}
+
+export interface OperatorContext {
+  engine: IaiEngine;
+  props: Record<string, any>;
+}
+
+============================================================
+文件: src/plugins/types.ts
+============================================================
+import type { IaiEngine } from '../core/IaiEngine';
+
+export interface IaiPlugin {
+  name: string;
+  install(engine: IaiEngine): void;
+
+  /** 可选：卸载时调用，用于清理事件、移除钩子等 */
+  uninstall?(engine: IaiEngine): void;
+}
+
+============================================================
+文件: src/renderers/vue/components/IaiFlatNode.vue
+============================================================
+<template>
+  <div
+    class="iai-flat-node"
+    :class="item.customClass"
+    :style="cssVars"
+    :data-node-id="item.id"
+    @pointerdown.capture="onFocus"
+    @pointerenter="onHover"
+    @pointerleave="onLeave"
+  >
+    <component
+      :is="component"
+      v-if="component"
+      :shared="sharedContainer"
+      :private="privateContainer"
+      :node-id="item.id"
+      :instance-id="item.node.instanceId"
+      :is-master="item.node.isMaster !== false"
+    />
+    <div v-else class="iai-missing">[面板未注册]</div>
+  </div>
+</template>
+
+<script setup lang="ts">
+import { computed, provide, reactive } from 'vue';
+import type { RenderItem } from '../../../core/types';
+import { ENGINE_KEY, useEngine } from '../composables/useIai';
+const props = defineProps<{ item: RenderItem; component: any }>();
+const emit = defineEmits<{ (e: 'focus', id: string): void }>();
+
+const engine = useEngine();          // 获取父级注入的引擎实例
+provide(ENGINE_KEY, engine);        // 继续向下注入，保持上下文
+
+const sharedCache = new Map<string, Record<string, any>>();
+
+const sharedContainer = computed(() => {
+  const panelType = props.item.node.panelType;
+  if (!sharedCache.has(panelType)) {
+    const raw = engine.getSharedContainer(panelType);
+    sharedCache.set(panelType, reactive(raw));
+  }
+  return sharedCache.get(panelType)!;
+});
+
+const onFocus = () => emit('focus', props.item.id);
+const onHover = () => engine.setHover(props.item.id);
+const onLeave = () => {
+  if (engine.getHover() === props.item.id) {
+    engine.setHover(null);
+  }
+};
+
+const cssVars = computed(() => {
+  const { rect, zIndex } = props.item;
+  return {
+    '--node-x': `${Math.round(rect.x)}px`,
+    '--node-y': `${Math.round(rect.y)}px`,
+    '--node-w': `${Math.round(rect.width)}px`,
+    '--node-h': `${Math.round(rect.height)}px`,
+    '--node-z': zIndex,
+  };
+});
+
+// 使用一个 Map 缓存已包装的响应式私有容器
+const privateCache = new Map<string, Record<string, any>>();
+
+const privateContainer = computed(() => {
+  const panelId = props.item.node.id;
+  if (!privateCache.has(panelId)) {
+    const raw = engine.getPrivateContainer(panelId);
+    privateCache.set(panelId, reactive(raw));
+  }
+  return privateCache.get(panelId)!;
+});
+
+</script>
+
+<style scoped>
+.iai-flat-node {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: var(--node-w);
+  height: var(--node-h);
+  z-index: var(--node-z);
+  transform: translate3d(var(--node-x), var(--node-y), 0);
+  will-change: transform;
+  overflow: hidden;
+  box-sizing: border-box;
+  border-right: 1px solid #333;
+  border-bottom: 1px solid #333;
+}
+.iai-flat-node.is-floating {
+  border: 2px solid #4fc1ff;
+  border-radius: 6px;
+  box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+}
+.iai-missing {
+  color: #ff5f56;
+  padding: 10px;
+}
+
+</style>
+
+============================================================
+文件: src/renderers/vue/components/IaiLayout.vue
+============================================================
+<template>
+  <div ref="containerRef" class="iai-layout-container">
+    <!-- 面板渲染层 -->
+    <div class="iai-panel-layer">
+      <IaiFlatNode
+        v-for="item in renderItems"
+        :key="item.id"
+        :item="item"
+        :component="engine.getComp(item.node.panelType)"
+        @focus="engine.focus(item.id)"
+      />
+    </div>
+
+    <!-- 插件覆盖层（自动渲染有 UI 的插件） -->
+    <div class="iai-plugin-overlay-layer">
+      <component
+        v-for="p in overlayPlugins"
+        :key="p.name"
+        :is="(p as any).overlayComponent"
+      />
+    </div>
+  </div>
+</template>
+
+<script setup lang="ts">
+import { ref, computed, onMounted, onUnmounted, provide } from 'vue';
+import type { IaiEngine } from '../../../core/IaiEngine';
+import { ENGINE_KEY } from '../composables/useIai';
+import IaiFlatNode from './IaiFlatNode.vue';
+
+const props = defineProps<{ engine: IaiEngine }>();
+const containerRef = ref<HTMLElement | null>(null);
+const viewport = ref({ width: 0, height: 0 });
+
+provide(ENGINE_KEY, props.engine);
+
+// 面板类型列表（自动从引擎获取，响应式）
+const panelTypes = computed(() => props.engine.getRegisteredTypes());
+provide('PANEL_TYPES', panelTypes);
+
+// 插件覆盖层（自动渲染有 UI 的插件）
+const overlayPlugins = computed(() =>
+  props.engine.getPlugins().filter((p: any) => (p as any).overlayComponent)
+);
+
+// 渲染项计算
+const renderItems = computed(() =>
+  props.engine.getRenderItems(viewport.value.width, viewport.value.height)
+);
+
+// 视口更新
+const updateViewport = () => {
+  if (containerRef.value) {
+    const rect = containerRef.value.getBoundingClientRect();
+    viewport.value = { width: rect.width, height: rect.height };
+    props.engine.setViewport(rect.width, rect.height);
+  }
+};
+
+let resizeObserver: ResizeObserver | null = null;
+onMounted(() => {
+  resizeObserver = new ResizeObserver(updateViewport);
+  if (containerRef.value) resizeObserver.observe(containerRef.value);
+  updateViewport();
+  props.engine.events.on('tree:update', updateViewport);
+  props.engine.events.on('free:update', updateViewport);
+});
+
+onUnmounted(() => {
+  resizeObserver?.disconnect();
+  props.engine.events.off('tree:update', updateViewport);
+  props.engine.events.off('free:update', updateViewport);
+});
+</script>
+
+<style scoped>
+.iai-layout-container {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: #1e1e1e;
+}
+.iai-panel-layer {
+  position: absolute;
+  inset: 0;
+  pointer-events: auto;
+}
+.iai-plugin-overlay-layer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+</style>
+
+============================================================
+文件: src/renderers/vue/components/ResizeHandle.vue
+============================================================
+<template>
+  <div
+    v-if="visible"
+    class="resize-handle"
+    @pointerdown.prevent.stop="onPointerDown"
+    title="拖拽调整大小"
+  ></div>
+</template>
+
+<script setup lang="ts">
+import { computed, onUnmounted } from 'vue';
+import { useEngine } from '../composables/useIai';
+import type { OperatorPlugin } from '../../../plugins/operator';
+const props = defineProps<{ itemId: string; visible: boolean }>();
+const engine = useEngine();
+const operator = computed(() =>
+  engine.getPlugins().find(p => p.name === 'OperatorPlugin') as OperatorPlugin
+);
+
+let cleanup: (() => void) | null = null;
+
+const onPointerDown = (e: PointerEvent) => {
+  const fp = engine.getFree(props.itemId);
+  if (!fp) return;
+
+  const startW = fp.width;
+  const startH = fp.height;
+
+  // 启动通用拖拽事件源
+  operator.value?.exec('drag.start', {
+    sourceId: props.itemId,
+    initialX: e.clientX,
+    initialY: e.clientY,
+    threshold: 2,
+  });
+
+  // 监听拖拽移动，实时调整大小
+  const onMove = (data: any) => {
+    if (data.sourceId !== props.itemId) return;
+    const newW = Math.max(40, startW + data.deltaX);
+    const newH = Math.max(40, startH + data.deltaY);
+    operator.value?.exec('float.resize', { id: props.itemId, width: newW, height: newH });
+  };
+
+  // 拖拽结束，执行四参考线约束
+  const onEnd = () => {
+    operator.value?.exec('float.clamp', { target: props.itemId });
+    engine.events.off('drag:move', onMove);
+    engine.events.off('drag:end', onEnd);
+    cleanup = null;
+  };
+
+  engine.events.on('drag:move', onMove);
+  engine.events.on('drag:end', onEnd);
+  cleanup = () => {
+    engine.events.off('drag:move', onMove);
+    engine.events.off('drag:end', onEnd);
+  };
+};
+
+onUnmounted(() => {
+  cleanup?.();
+});
+</script>
+
+<style scoped>
+.resize-handle {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: 16px;      /* 给一个实际宽高，避免被 overflow:hidden 裁掉 */
+  height: 16px;
+  cursor: nwse-resize;
+  z-index: 10;
+  background: linear-gradient(135deg, transparent 50%, rgba(255,255,255,0.3) 50%);
+}
+.resize-handle:hover {
+  background: linear-gradient(135deg, transparent 50%, rgba(0,122,204,0.8) 50%);
+}
+</style>
+
+============================================================
+文件: src/renderers/vue/composables/useIai.ts
+============================================================
+import { inject, type InjectionKey } from 'vue';
+import type { IaiEngine } from '../../../core/IaiEngine';
+
+export const ENGINE_KEY: InjectionKey<IaiEngine> = Symbol('IAI_ENGINE');
+
+export function useEngine(): IaiEngine {
+  const engine = inject(ENGINE_KEY);
+  if (!engine) {
+    throw new Error('[IaiEngine] useEngine 必须在 IaiLayout 内部使用');
+  }
+  return engine;
+}
+

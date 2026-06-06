@@ -2,7 +2,7 @@
 import type { Node, Rect, GeometryMap, LeafNode } from '../../core/types';
 import type { OrthogonalGrid, GridLine } from '../../core/solver';
 
-export type DragMode = 'domino' | 'simple';
+export type DragMode = 'domino' | 'simple' | 'magnetic';
 
 export interface DominoConfig {
   fpsLimit: number;
@@ -10,6 +10,8 @@ export interface DominoConfig {
   clampToViewport: boolean;
   rigidClamp: boolean;
   zIndexBase: number;
+  mode?: 'domino' | 'simple' | 'magnetic';
+  snapToMin?: boolean;
 }
 
 export interface DragContext {

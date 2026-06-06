@@ -1,12 +1,10 @@
 <template>
-  <div 
-    class="interactive-split-overlay" 
+  <div
+    class="interactive-split-overlay"
     v-show="splitState.isActive"
-    :style="{ cursor: config.cursor }"
   >
     <div class="split-capture-layer"></div>
-
-    <div 
+    <div
       v-if="splitState.isHovering"
       class="split-preview-line"
       :style="lineStyle"
@@ -24,41 +22,51 @@ const engine = useEngine();
 
 const config = computed(() => {
   const plugin = engine.getPlugins().find(p => p.name === 'InteractiveSplitPlugin') as InteractiveSplitPlugin;
-  return plugin?.config || ({} as any);
+  return plugin?.config || {};
 });
+
+// 默认视觉样式（不再从配置读取，改为固定值，方便全局 CSS 覆盖）
+const DEFAULT_LINE_WIDTH = 2;
+const DEFAULT_LINE_COLOR = '#007fd4';
+const DEFAULT_SNAP_COLOR = '#00ff88';
 
 const lineStyle = computed(() => {
   const c = config.value;
-  const baseStyle = {
-    backgroundColor: splitState.isSnapped ? c.snapColor : c.lineColor,
-    boxShadow: `0 0 6px ${splitState.isSnapped ? c.snapColor : c.lineColor}`,
+  const isSnapped = splitState.isSnapped;
+  const color = isSnapped ? DEFAULT_SNAP_COLOR : DEFAULT_LINE_COLOR;
+  const lineWidth = DEFAULT_LINE_WIDTH;
+
+  const baseStyle: Record<string, string> = {
+    backgroundColor: color,
+    boxShadow: `0 0 6px ${color}`,
   };
 
   if (splitState.direction === 'horizontal') {
     return {
       ...baseStyle,
-      left: `${splitState.x - c.lineWidth / 2}px`,
+      left: `${splitState.x - lineWidth / 2}px`,
       top: `${splitState.y}px`,
-      width: `${c.lineWidth}px`,
+      width: `${lineWidth}px`,
       height: `${splitState.length}px`,
     };
   } else {
     return {
       ...baseStyle,
       left: `${splitState.x}px`,
-      top: `${splitState.y - c.lineWidth / 2}px`,
+      top: `${splitState.y - lineWidth / 2}px`,
       width: `${splitState.length}px`,
-      height: `${c.lineWidth}px`,
+      height: `${lineWidth}px`,
     };
   }
 });
 </script>
 
-<style scoped>
+<style>
 .interactive-split-overlay {
   position: absolute;
   inset: 0;
   z-index: 15000;
+  cursor: crosshair; /* 固定十字准星，不再从配置读取 */
 }
 .split-capture-layer {
   width: 100%;

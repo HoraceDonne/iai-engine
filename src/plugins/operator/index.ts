@@ -2,7 +2,7 @@ import type { IaiPlugin } from '../types';
 import type { IaiEngine } from '../../core/IaiEngine';
 import type { Operator } from './types';
 import { panelSplit } from './operators/panelSplit';
-import { panelClose } from './operators/panelClose';
+import { panelHide } from './operators/panelHide';
 import { panelSwitch } from './operators/panelSwitch';
 import { panelFloat } from './operators/panelFloat';
 import { stashRestore } from './operators/stashRestore';
@@ -27,7 +27,7 @@ export class OperatorPlugin implements IaiPlugin {
   constructor() {
     // 注册所有内置操作符
     this.register(panelSplit);
-    this.register(panelClose);
+    this.register(panelHide);
     this.register(panelSwitch);
     this.register(panelFloat);
     this.register(stashRestore);

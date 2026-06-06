@@ -12,48 +12,53 @@ export const dragStart: Operator = {
       detectHover = false,
     } = props;
 
-    if (typeof initialX !== 'number' || typeof initialY !== 'number') {
-      console.warn('[drag.start] 需要传入 initialX 和 initialY');
-      return;
-    }
+    if (typeof initialX !== 'number' || typeof initialY !== 'number') return;
 
     const sourceEntity = engine.getAny(sourceId);
     if (!sourceEntity) return;
-
     const sourceType = engine.getFree(sourceId) ? 'float' : 'grid';
 
     let startX = initialX;
     let startY = initialY;
-    let currentGlobalX = initialX;
-    let currentGlobalY = initialY;
     let isDragging = false;
     let hasMoved = false;
     let rafId: number | null = null;
     let hoveredPanelId: string | null = null;
 
-    if (sourceType === 'float') {
-      const fp = engine.getFree(sourceId);
-      if (fp) {
-        fp.panel.ignoreHover = true;
-        engine.events.emit('free:update', { count: engine.getAllFree().length });
+    let shield: HTMLDivElement | null = null;
+    let cancelled = false;                    // 🌟 取消标志
+
+    const cleanup = () => {
+      if (rafId) {
+        cancelAnimationFrame(rafId);
+        rafId = null;
       }
-    }
+      if (shield) {
+        shield.remove();
+        shield = null;
+      }
+      document.body.style.userSelect = '';
+      document.body.style.cursor = '';
+      window.removeEventListener('pointermove', onPointerMove);
+      window.removeEventListener('pointerup', onPointerUp);
+      window.removeEventListener('keydown', onKeyDown);
+    };
 
     const onPointerMove = (e: PointerEvent) => {
-      currentGlobalX = e.clientX;
-      currentGlobalY = e.clientY;
-
+      if (cancelled) return;
       if (!hasMoved) {
-        const dx = Math.abs(currentGlobalX - startX);
-        const dy = Math.abs(currentGlobalY - startY);
+        const dx = Math.abs(e.clientX - startX);
+        const dy = Math.abs(e.clientY - startY);
         if (dx < threshold && dy < threshold) return;
         hasMoved = true;
         isDragging = true;
 
-        engine.events.emit('drag:shield', {
-          active: true,
-          cursor: sourceType === 'float' ? 'move' : 'grabbing',
-        });
+        shield = document.createElement('div');
+        shield.style.cssText = 'position:fixed;inset:0;z-index:99999;cursor:inherit;';
+        document.body.appendChild(shield);
+        document.body.style.userSelect = 'none';
+        document.body.style.cursor = sourceType === 'float' ? 'move' : 'grabbing';
+
         engine.events.emit('drag:start', { sourceId, sourceType });
       }
 
@@ -62,26 +67,12 @@ export const dragStart: Operator = {
       if (!rafId) {
         rafId = requestAnimationFrame(() => {
           let panelId: string | null = null;
-          let localX = currentGlobalX;
-          let localY = currentGlobalY;
 
           if (detectHover) {
-            const container = document.querySelector('.iai-layout-container');
-            if (container) {
-              const rect = container.getBoundingClientRect();
-              localX = currentGlobalX - rect.left;
-              localY = currentGlobalY - rect.top;
-            }
-
-            // 临时隐藏被拖拽面板，避免检测到自身
-            const selfEl = document.querySelector(`[data-node-id="${sourceId}"]`) as HTMLElement;
-            const prevDisplay = selfEl?.style.display ?? '';
-            if (selfEl) selfEl.style.display = 'none';
-
-            const elemBelow = document.elementFromPoint(currentGlobalX, currentGlobalY);
+            if (shield) shield.style.display = 'none';
+            const elemBelow = document.elementFromPoint(e.clientX, e.clientY);
             panelId = elemBelow?.closest?.('[data-node-id]')?.getAttribute?.('data-node-id') || null;
-
-            if (selfEl) selfEl.style.display = prevDisplay;
+            if (shield) shield.style.display = '';
           }
 
           if (panelId !== hoveredPanelId) {
@@ -91,10 +82,10 @@ export const dragStart: Operator = {
           engine.events.emit('drag:move', {
             sourceId,
             sourceType,
-            x: localX,
-            y: localY,
-            deltaX: localX - startX,
-            deltaY: localY - startY,
+            x: e.clientX,
+            y: e.clientY,
+            deltaX: e.clientX - startX,
+            deltaY: e.clientY - startY,
             hoveredPanelId,
           });
 
@@ -103,51 +94,47 @@ export const dragStart: Operator = {
       }
     };
 
-    const onPointerUp = () => {
-      if (rafId) {
-        cancelAnimationFrame(rafId);
-        rafId = null;
-      }
-
-      engine.events.emit('drag:shield', { active: false });
-
-      if (sourceType === 'float') {
-        const fp = engine.getFree(sourceId);
-        if (fp) {
-          fp.panel.ignoreHover = false;
-          engine.events.emit('free:update', { count: engine.getAllFree().length });
-        }
-      }
+    const onPointerUp = (e: PointerEvent) => {
+      if (cancelled) return;
+      cleanup();
 
       if (isDragging) {
         let finalPanelId: string | null = null;
         if (detectHover) {
-          const selfEl = document.querySelector(`[data-node-id="${sourceId}"]`) as HTMLElement;
-          const prev = selfEl?.style.display ?? '';
-          if (selfEl) selfEl.style.display = 'none';
-
-          const elemBelow = document.elementFromPoint(currentGlobalX, currentGlobalY);
+          const elemBelow = document.elementFromPoint(e.clientX, e.clientY);
           finalPanelId = elemBelow?.closest?.('[data-node-id]')?.getAttribute?.('data-node-id') || null;
-
-          if (selfEl) selfEl.style.display = prev;
         }
 
         engine.events.emit('drag:end', {
           sourceId,
           sourceType,
-          endX: currentGlobalX,
-          endY: currentGlobalY,
-          deltaX: currentGlobalX - startX,
-          deltaY: currentGlobalY - startY,
+          endX: e.clientX,
+          endY: e.clientY,
+          deltaX: e.clientX - startX,
+          deltaY: e.clientY - startY,
           hoveredPanelId: finalPanelId,
         });
       }
+    };
 
-      window.removeEventListener('pointermove', onPointerMove);
-      window.removeEventListener('pointerup', onPointerUp);
+    // 用于键盘取消（默认 Escape）
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        cancel();
+      }
+    };
+
+    const cancel = () => {
+      if (cancelled) return;
+      cancelled = true;
+      cleanup();
+      // 发射一个假的 drag:end ？ 不发射，外部通过 cancel 感知。
     };
 
     window.addEventListener('pointermove', onPointerMove);
     window.addEventListener('pointerup', onPointerUp);
+    window.addEventListener('keydown', onKeyDown);   // 全局 Escape 取消
+
+    return { cancel };   // 🌟 返回取消函数
   },
 };

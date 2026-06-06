@@ -1,4 +1,3 @@
-// src/plugins/docking/state.ts
 import { reactive } from 'vue';
 
 export const dockingState = reactive<{

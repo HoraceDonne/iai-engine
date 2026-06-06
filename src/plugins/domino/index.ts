@@ -16,6 +16,9 @@ export class DominoPlugin implements IaiPlugin {
       clampToViewport: true,
       rigidClamp: true,
       zIndexBase: 10,
+      mode: 'domino', 
+      snapToMin: true,
+
       ...config,
     };
   }

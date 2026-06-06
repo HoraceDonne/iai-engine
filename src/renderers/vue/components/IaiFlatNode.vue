@@ -11,6 +11,8 @@
     <component
       :is="component"
       v-if="component"
+      :shared="sharedContainer"
+      :private="privateContainer"
       :node-id="item.id"
       :instance-id="item.node.instanceId"
       :is-master="item.node.isMaster !== false"
@@ -20,7 +22,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, provide } from 'vue';
+import { computed, provide, reactive } from 'vue';
 import type { RenderItem } from '../../../core/types';
 import { ENGINE_KEY, useEngine } from '../composables/useIai';
 const props = defineProps<{ item: RenderItem; component: any }>();
@@ -28,6 +30,17 @@ const emit = defineEmits<{ (e: 'focus', id: string): void }>();
 
 const engine = useEngine();          // 获取父级注入的引擎实例
 provide(ENGINE_KEY, engine);        // 继续向下注入，保持上下文
+
+const sharedCache = new Map<string, Record<string, any>>();
+
+const sharedContainer = computed(() => {
+  const panelType = props.item.node.panelType;
+  if (!sharedCache.has(panelType)) {
+    const raw = engine.getSharedContainer(panelType);
+    sharedCache.set(panelType, reactive(raw));
+  }
+  return sharedCache.get(panelType)!;
+});
 
 const onFocus = () => emit('focus', props.item.id);
 const onHover = () => engine.setHover(props.item.id);
@@ -47,6 +60,19 @@ const cssVars = computed(() => {
     '--node-z': zIndex,
   };
 });
+
+// 使用一个 Map 缓存已包装的响应式私有容器
+const privateCache = new Map<string, Record<string, any>>();
+
+const privateContainer = computed(() => {
+  const panelId = props.item.node.id;
+  if (!privateCache.has(panelId)) {
+    const raw = engine.getPrivateContainer(panelId);
+    privateCache.set(panelId, reactive(raw));
+  }
+  return privateCache.get(panelId)!;
+});
+
 </script>
 
 <style scoped>

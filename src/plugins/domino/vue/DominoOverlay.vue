@@ -12,9 +12,12 @@
       :key="'dv-' + line.id"
       class="drag-handle vertical"
       :class="{ 'is-active': activeSplitId === line.id }"
-      :style="{ left: line.position + 'px', top: line.crossStart + 'px', height: (line.crossEnd - line.crossStart) + 'px' }"
+      :data-grid-index="line.index" 
+      :data-first="line.isFirst || undefined"
+      :data-last="line.isLast || undefined"
+      :style="getHandleStyle(line, 'vertical')"
       @pointerdown.prevent="startDrag(line.id, 'vertical', $event)"
-    ></div>
+    />
 
     <div
       v-for="line in gridLines.hLines"
@@ -22,14 +25,13 @@
       :key="'dh-' + line.id"
       class="drag-handle horizontal"
       :class="{ 'is-active': activeSplitId === line.id }"
-      :style="{ top: line.position + 'px', left: line.crossStart + 'px', width: (line.crossEnd - line.crossStart) + 'px' }"
+      :data-grid-index="line.index"
+      :data-first="line.isFirst || undefined"
+      :data-last="line.isLast || undefined"
+      :style="getHandleStyle(line, 'horizontal')"
       @pointerdown.prevent="startDrag(line.id, 'horizontal', $event)"
-    ></div>
-
-    <div class="mode-switcher" @pointerdown.stop>
-      <label><input type="radio" v-model="dragMode" value="domino" /> 多米诺推挤</label>
-      <label><input type="radio" v-model="dragMode" value="simple" /> 基础卡位</label>
-    </div>
+    />
+    
   </div>
 </template>
 
@@ -41,8 +43,8 @@ import {
   simulatePush,
   rebuildTreeRatios,
   unlockAndSyncRatios,
-  type DragMode,
   type DragContext,
+  type DragMode
 } from '../core';
 import type { DominoPlugin } from '../index';
 
@@ -51,12 +53,11 @@ const containerRef = ref<HTMLElement | null>(null);
 const viewport = ref({ width: 0, height: 0 });
 
 const isDragging = ref(false);
-const dragMode = ref<DragMode>('domino');
+const dragMode = computed(() => dominoPlugin.config.mode || 'domino');
 const activeSplitId = ref<string | null>(null);
 const activeDirection = ref<'horizontal' | 'vertical' | null>(null);
 
 const dominoPlugin = engine.getPlugins().find(p => p.name === 'DominoPlugin') as DominoPlugin;
-const opPlugin = computed(() => engine.getPlugins().find((p: any) => p.name === 'OperatorPlugin') as any);
 
 const gridLines = ref<{
   vLines: Array<{
@@ -65,6 +66,9 @@ const gridLines = ref<{
     crossStart: number;
     crossEnd: number;
     resizable: boolean;
+    index: number;
+    isFirst: boolean;
+    isLast: boolean; 
   }>;
   hLines: Array<{
     id: string;
@@ -72,6 +76,9 @@ const gridLines = ref<{
     crossStart: number;
     crossEnd: number;
     resizable: boolean;
+    index: number;
+    isFirst: boolean;
+    isLast: boolean; 
   }>;
 }>({ vLines: [], hLines: [] });
 
@@ -83,24 +90,40 @@ const updateOverlay = () => {
   const rawGrid = engine.getGridLines(geoMap);
 
   const root = engine.getRoot();
-  const findNode = (id: string): any => {
-    if (!root) return null;
-    const dfs = (node: any): any => {
-      if (node.id === id) return node;
-      if (node.children) return dfs(node.children[0]) || dfs(node.children[1]);
-      return null;
-    };
-    return dfs(root) || { resizable: true };
+  
+  // 🌟 修正 1：一次性遍历树，构建 resizable 映射表，彻底干掉 O(N^2) 的嵌套 DFS 循环
+  const resizableMap = new Map<string, boolean>();
+  const traverse = (node: any) => {
+    if (!node) return;
+    resizableMap.set(node.id, node.resizable !== false);
+    if (node.children) {
+      traverse(node.children[0]);
+      traverse(node.children[1]);
+    }
   };
+  traverse(root);
+
+  // 🌟 修正 2：强制按绝对物理坐标排序，保证 index 永远匹配视觉顺序！
+  const sortedVLines = [...rawGrid.vLines].sort((a, b) => a.position - b.position);
+  const sortedHLines = [...rawGrid.hLines].sort((a, b) => a.position - b.position);
+
+  const vLen = sortedVLines.length;
+  const hLen = sortedHLines.length;
 
   gridLines.value = {
-    vLines: rawGrid.vLines.map(line => ({
+    vLines: sortedVLines.map((line, index) => ({
       ...line,
-      resizable: findNode(line.id)?.resizable !== false,
+      resizable: resizableMap.has(line.id) ? resizableMap.get(line.id)! : true,
+      index, // 现在的 index 是绝对准确的视觉索引
+      isFirst: index === 0,
+      isLast: index === vLen - 1,
     })),
-    hLines: rawGrid.hLines.map(line => ({
+    hLines: sortedHLines.map((line, index) => ({
       ...line,
-      resizable: findNode(line.id)?.resizable !== false,
+      resizable: resizableMap.has(line.id) ? resizableMap.get(line.id)! : true,
+      index,
+      isFirst: index === 0,
+      isLast: index === hLen - 1,
     })),
   };
 };
@@ -144,7 +167,6 @@ const startDrag = (splitId: string, direction: 'horizontal' | 'vertical', e: Poi
     hLines: gridLines.value.hLines.map(({ resizable, ...rest }) => rest),
   };
 
-  // 🌟 唯一修改：传入 getPanelProps
   activeCtx = createDragContext(
     rootTree, splitId, viewport.value, geoMap, pureGrid, dominoPlugin.config, dragMode.value,
     (node: any) => engine.getPanelProps(node)
@@ -177,7 +199,6 @@ const startDrag = (splitId: string, direction: 'horizontal' | 'vertical', e: Poi
       const newTree = unlockAndSyncRatios(rootTree, affectedIds, geoMap);
       engine.mount(newTree, true);
       const updatedGeoMap = engine.getGeoMap(viewport.value.width, viewport.value.height);
-      // 🌟 唯一修改：传入 getPanelProps
       activeCtx = createDragContext(
         newTree, splitId, viewport.value, updatedGeoMap, pureGrid, dominoPlugin.config, dragMode.value,
         (node: any) => engine.getPanelProps(node)
@@ -225,7 +246,52 @@ const onDragMove = (e: PointerEvent) => {
   if (!rafId) {
     rafId = requestAnimationFrame(() => {
       if (!activeCtx) return;
-      const result = simulatePush(activeCtx, intendedDelta);
+
+    let result;
+
+    if (dominoPlugin.config.mode === 'magnetic') {
+      const snapCtx = { ...activeCtx, mode: 'simple' as DragMode };
+      result = simulatePush(snapCtx, intendedDelta);
+
+      const dir = activeCtx.direction;
+      const linePos = result.positions.get(activeCtx.splitId);
+      if (linePos !== undefined) {
+        for (const panel of activeCtx.leafPanels) {
+          let isLeftOrTop = false;
+          let otherLineId: string | null = null;
+
+          if (dir === 'horizontal' && panel.leftLineId === activeCtx.splitId) {
+            isLeftOrTop = true; otherLineId = panel.rightLineId;
+          } else if (dir === 'horizontal' && panel.rightLineId === activeCtx.splitId) {
+            isLeftOrTop = false; otherLineId = panel.leftLineId;
+          } else if (dir === 'vertical' && panel.topLineId === activeCtx.splitId) {
+            isLeftOrTop = true; otherLineId = panel.bottomLineId;
+          } else if (dir === 'vertical' && panel.bottomLineId === activeCtx.splitId) {
+            isLeftOrTop = false; otherLineId = panel.topLineId;
+          } else {
+            continue;
+          }
+
+          const node = engine.getNode(panel.id);
+          const props = node ? engine.getPanelProps(node) : null;
+          const threshold = props?.meta?.snapThreshold ?? 0;
+          const otherPos = otherLineId
+            ? result.positions.get(otherLineId)
+            : (isLeftOrTop ? activeCtx.viewportWidth : 0);
+          if (otherPos === undefined) continue;
+
+          const currentSize = isLeftOrTop ? otherPos - linePos : linePos - otherPos;
+          if (Math.abs(currentSize - panel.minSize) < threshold) {
+            const correctedPos = isLeftOrTop ? otherPos - panel.minSize : otherPos + panel.minSize;
+            result.positions.set(activeCtx.splitId, correctedPos);
+            break;
+          }
+        }
+      }
+    } else {
+      result = simulatePush(activeCtx, intendedDelta);
+    }
+
       const rootRect = { x: 0, y: 0, width: activeCtx.viewportWidth, height: activeCtx.viewportHeight };
       const newTree = rebuildTreeRatios(engine.getRoot()!, rootRect, result.positions, activeCtx);
       engine.mount(newTree, true);
@@ -242,7 +308,6 @@ const onDragEnd = () => {
 
     for (const node of allNodes) {
       const rect = geoMap.get(node.id);
-      // 🌟 唯一修改：获取真实属性
       const realProps = engine.getPanelProps(node);
       if (rect && realProps.minSize !== undefined) {
         const actualSize = currentDirection === 'horizontal' ? rect.width : rect.height;
@@ -269,6 +334,23 @@ const onDragEnd = () => {
     rafId = null;
   }
 };
+
+const getHandleStyle = (line: any, dir: 'vertical' | 'horizontal') => {
+  if (dir === 'vertical') {
+    return {
+      left: `${line.position}px`,
+      top: `${line.crossStart}px`,
+      height: `${line.crossEnd - line.crossStart}px`,
+    };
+  } else {
+    return {
+      top: `${line.position}px`,
+      left: `${line.crossStart}px`,
+      width: `${line.crossEnd - line.crossStart}px`,
+    };
+  }
+};
+
 </script>
 
 <style scoped>
@@ -286,20 +368,32 @@ const onDragEnd = () => {
 .drag-handle {
   position: absolute;
   pointer-events: auto;
+  z-index: 100;
+  transition: background-color 0.15s ease;
+}
+/* 默认好看的样式 */
+.drag-handle {
   background-color: transparent;
-  transition: background-color 0.1s ease;
 }
-.drag-handle.vertical { width: 9px; margin-left: -4.5px; cursor: col-resize; }
-.drag-handle.horizontal { height: 9px; margin-top: -4.5px; cursor: row-resize; }
-.drag-handle:hover, .drag-handle.is-active { background-color: rgba(0, 127, 212, 0.25); }
-.domino-overlay:has(.drag-shield) .drag-handle:not(.is-active) { pointer-events: none; }
-.mode-switcher {
-  position: absolute; bottom: 20px;
-  right: 20px;
-  background: rgba(0, 0, 0, 0.8); color: #fff;
-  padding: 10px; border-radius: 6px; border: 1px solid #444;
-  display: flex;
-  gap: 10px; font-size: 12px; pointer-events: auto; z-index: 10000;
+.drag-handle:hover {
+  background-color: rgba(0, 127, 212, 0.15);
 }
-.mode-switcher label { cursor: pointer; display: flex; align-items: center; gap: 4px; }
+.drag-handle.is-active {
+  background-color: rgba(0, 127, 212, 0.35) !important;
+}
+/* 垂直线 */
+.drag-handle.vertical {
+  width: 7px;
+  margin-left: -3.5px;
+  cursor: col-resize;
+}
+/* 水平线 */
+.drag-handle.horizontal {
+  height: 7px;
+  margin-top: -3.5px;
+  cursor: row-resize;
+}
+.domino-overlay:has(.drag-shield) .drag-handle:not(.is-active) {
+  pointer-events: none;
+}
 </style>
